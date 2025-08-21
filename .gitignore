@@ -1,0 +1,25 @@
+# secrets
+.env
+*.key
+*.pem
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# node / build (на будущее)
+node_modules/
+dist/
+build/
+
+# os / ide
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# logs / tmp
+*.log
+*.tmp
