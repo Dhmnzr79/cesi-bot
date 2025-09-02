@@ -1,7 +1,7 @@
 # rag_engine.py
 import os
 import numpy as np
-import openai
+from openai import OpenAI
 import faiss
 import yaml
 import re
@@ -65,7 +65,14 @@ def _slugify_implant_kind(name: str) -> str:
     return re.sub(r'[^a-z0-9\-]+', '-', n)  # unidecode(n) - опционально
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Инициализация OpenAI клиента v1
+try:
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=30.0)
+    print("✅ OpenAI клиент v1 успешно инициализирован")
+except Exception as e:
+    print(f"❌ Ошибка инициализации OpenAI клиента: {e}")
+    openai_client = None
 
 # Типы данных
 class Frontmatter:
@@ -327,7 +334,7 @@ def postprocess_answer_with_empathy(base_text: str, tone: str = "friendly", emot
         
         system_prompt = build_empathy_prompt(tone, emotion, allow_emoji, cta_text, cta_link)
         
-        completion = openai.ChatCompletion.create(
+        completion = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,  # еще меньше креативности
             top_p=0.8,       # ограничить выбор токенов
@@ -337,7 +344,7 @@ def postprocess_answer_with_empathy(base_text: str, tone: str = "friendly", emot
             ]
         )
         
-        text = completion.choices[0].message["content"].strip()
+        text = completion.choices[0].message.content.strip()
         
         # Постобработка
         text = re.sub(r'^\s*#{1,6}\s*', '', text, flags=re.MULTILINE)  # убираем заголовки
@@ -382,7 +389,7 @@ def _find_doctor_direct_or_fuzzy(query: str):
             return ch
     # 2) морфологически «мягко» по фамилии: Моисеев/Моисеева/Моисееву...
     for k, ch in DOCTOR_NAME_TO_CHUNK.items():
-        if "" not in k: # только однословные ключи = фамилии
+        if " " not in k: # только однословные ключи = фамилии
             if re.search(rf"\b{k}\w*\b", q, flags=re.IGNORECASE):
                 return ch
     # 3) опечатки
@@ -640,12 +647,12 @@ try:
         print(f"\u23f3 Генерация эмбеддингов для {len(all_chunks)} чанков...")
         
         def get_embedding(text: str) -> List[float]:
-            resp = openai.Embedding.create(
+            resp = openai_client.embeddings.create(
                 model="text-embedding-3-small",
                 input=text,
                 encoding_format="float"
             )
-            return resp["data"][0]["embedding"]
+            return resp.data[0].embedding
         
         # Делаем функцию глобально доступной
         globals()['get_embedding'] = get_embedding
@@ -673,12 +680,12 @@ except Exception as e:
 def get_embedding(text: str) -> List[float]:
     """Fallback функция для создания эмбеддингов"""
     try:
-        resp = openai.Embedding.create(
+        resp = openai_client.embeddings.create(
             model="text-embedding-3-small",
             input=text,
             encoding_format="float"
         )
-        return resp["data"][0]["embedding"]
+        return resp.data[0].embedding
     except Exception as e:
         print(f"Ошибка при создании эмбеддинга: {e}")
         # Возвращаем нулевой вектор
@@ -977,7 +984,7 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str) -> SynthJSO
 }}
 """
 
-    completion = openai.ChatCompletion.create(
+    completion = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,  # низкая температура для стабильности
         max_tokens=250,   # ограничиваем длину
@@ -1161,6 +1168,45 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     for i, chunk in enumerate(relevant_chunks[:3]):  # Показываем первые 3
         print(f"  {i+1}. {chunk.file_name}: {chunk.text[:100]}...")
     print(f"📝 Ответ: {final_text[:200]}...")
+    
+    # Добавляем used_chunks в метаданные
+    used_ids = [ch.id for ch in relevant_chunks]
+    rag_meta["used_chunks"] = used_ids
+    
     print(f"📋 Метаданные: {rag_meta}")
     
     return final_text, rag_meta
+
+def log_query_response(user_message: str, response: str, metadata: dict, chunks_used: List[str] = None):
+    """Логирует вопрос/ответ в файл для анализа"""
+    import json
+    from datetime import datetime
+    
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "question": user_message,
+        "answer": response,
+        "metadata": metadata,
+        "chunks_used": chunks_used or [],
+        "answer_length": len(response),
+        "has_cta": bool(metadata.get("cta_action")),
+        "topic": metadata.get("topic", "unknown"),
+        "doc_type": metadata.get("doc_type", "unknown")
+    }
+    
+    try:
+        # Создаем папку logs если её нет
+        logs_dir = Path("logs")
+        logs_dir.mkdir(exist_ok=True)
+        
+        # Записываем в JSONL файл
+        log_file = logs_dir / "queries.jsonl"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        
+        print(f"📝 Лог записан: {log_file}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка логирования: {e}")
+
+

@@ -1,25 +1,47 @@
-# secrets
-.env
-*.key
-*.pem
-
-# python
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+*.so
+*.egg-info/
+.eggs/
 
-# node / build (на будущее)
+# Среды и IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Логи и временные файлы
+logs/
+*.log
+*.tmp
+*.bak
+
+# Кэш и история
+.history/
+*.sqlite3
+db.sqlite3
+
+# Конфиги с секретами
+.env
+.env.*
+
+# Node/JS (если вдруг npm для widget-embed.js)
 node_modules/
 dist/
 build/
 
-# os / ide
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+# Архивы и дампы
+*.zip
+*.tar
+*.gz
+*.rar
 
-# logs / tmp
-*.log
-*.tmp
+# Системные файлы
+Thumbs.db
+desktop.ini
+
+# Jupyter и тетради (если когда-то появятся)
+*.ipynb_checkpoints/

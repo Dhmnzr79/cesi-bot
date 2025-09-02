@@ -6,7 +6,7 @@ import os
 import uuid
 import traceback
 import re
-import openai
+from openai import OpenAI
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -16,7 +16,14 @@ from rag_engine import get_rag_answer
 from datetime import datetime, timezone, timedelta, time
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Инициализация OpenAI клиента v1
+try:
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=30.0)
+    print("✅ OpenAI клиент v1 успешно инициализирован в app.py")
+except Exception as e:
+    print(f"❌ Ошибка инициализации OpenAI клиента в app.py: {e}")
+    openai_client = None
 
 app = Flask(__name__)
 CORS(app, origins=['https://dental41.ru', 'http://dental41.ru', 'https://dental-bot.ru', 'http://dental-bot.ru', 'https://dental-chat.ru', 'http://dental-chat.ru'])
@@ -30,6 +37,17 @@ EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 EMAIL_HOST = os.getenv("EMAIL_HOST")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
 
+
+def check_rate_limit(session_id):
+    """Проверяет rate-limit на заявки (не чаще 1/5 минут на session_id)"""
+    now = datetime.now()
+    last = session_states[session_id].get("last_lead_ts")
+    
+    if last and (now - last).seconds < 300:  # 5 минут = 300 секунд
+        return False
+    
+    session_states[session_id]["last_lead_ts"] = now
+    return True
 
 def send_lead_email(name, phone):
     msg = MIMEMultipart()
@@ -99,34 +117,39 @@ def build_cta(meta) -> dict | None:
 
 
 
-def simple_cancellation_check(message):
-    """Простая детекция очевидных отказов"""
-    cancel_phrases = [
-        "нет, спасибо", "нет спасибо", "передумал", "отмена", "не нужно", 
-        "не хочу", "не буду", "откажусь", "не надо", "не буду записываться",
-        "передумал записываться", "отменяю", "не хочу записываться", "спасибо нет"
-    ]
-    message_lower = message.lower()
+def detect_refusal(message):
+    """Категоризированная детекция отказа"""
+    # Нормализация
+    msg = (message or "").strip().lower()
     
-    # Проверяем точные фразы
-    if any(phrase in message_lower for phrase in cancel_phrases):
-        return True
+    # Явный отказ / пауза
+    REFUSALS = {
+        "hard": ["нет", "неинтересно", "отстаньте", "не надо", "удалите мои данные"],
+        "soft": ["подумаю", "позже", "свяжусь сам", "не сейчас", "не сегодня", "пока не нужно", "сам свяжусь", "спасибо", "позже", "не сейчас"]
+    }
     
-    # Проверяем комбинации ключевых слов
-    words = message_lower.split()
-    if "нет" in words and "спасибо" in words:
-        return True
-    if "не" in words and ("хочу" in words or "нужно" in words or "буду" in words):
-        return True
+    # Жесткий отказ
+    if any(kw == msg or kw in msg for kw in REFUSALS["hard"]):
+        return "hard"
     
-    # Проверяем простое "нет" (только если это единственное слово)
-    if message_lower.strip() == "нет":
-        return True
+    # Мягкий отказ
+    if any(kw == msg or kw in msg for kw in REFUSALS["soft"]):
+        return "soft"
     
-    return False
+    return None
+
+def validate_phone(phone):
+    """Простая валидация телефона (10+ цифр)"""
+    digits = ''.join(filter(str.isdigit, phone))
+    return len(digits) >= 10
 
 def gpt_cancellation_check(message):
     """Детекция отказа от записи через GPT"""
+    # Проверяем, что OpenAI клиент доступен
+    if not openai_client:
+        print("⚠️ OpenAI клиент недоступен, используем fallback")
+        return False
+    
     try:
         prompt = f"""
         Определи, хочет ли пользователь отказаться от записи на консультацию.
@@ -135,31 +158,40 @@ def gpt_cancellation_check(message):
         
         Ответь только "ДА" если это отказ, или "НЕТ" если это согласие или нейтральный ответ.
         
-        Примеры отказов: "нет", "нет спасибо", "передумал", "не хочу", "отмена", "не буду", "абракадабра", "фывфыв", "12345", "qwerty"
+        Примеры отказов: "нет", "нет спасибо", "передумал", "не хочу", "отмена", "не буду"
         Примеры согласий: "да", "хочу", "запишите", "конечно", "имя Иван", "телефон 1234567890"
         """
         
-        response = openai.ChatCompletion.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=10,
             temperature=0
         )
         answer = response.choices[0].message.content.strip().upper()
-        return answer == "ДА"
+        
+        # Улучшенная проверка "ДА" с поддержкой пунктуации
+        if answer.startswith("ДА"):
+            return True
+        return False
         
     except Exception as e:
-        print("Ошибка GPT-детекции отказов:", e)
+        print(f"❌ Ошибка GPT-детекции отказов: {e}")
         return False
 
 def is_cancellation(message):
     """Гибридная детекция отказа от записи"""
     # Сначала быстрая проверка очевидных случаев
-    if simple_cancellation_check(message):
-        return True
+    refusal_type = detect_refusal(message)
+    if refusal_type:
+        return refusal_type
     
     # Если не очевидно - используем GPT
-    return gpt_cancellation_check(message)
+    # LLM: True = мягкий отказ по умолчанию
+    if gpt_cancellation_check(message):
+        return "soft"
+    
+    return None
 
 
 @app.route('/chat', methods=['POST'])
@@ -175,15 +207,18 @@ def chat():
     # --- Этап сбора данных ---
     if session.get("state") == "ожидание_имени":
         # Проверяем отказ
-        if is_cancellation(message):
+        refusal_type = is_cancellation(message)
+        if refusal_type == "hard":
             session.clear()
             return jsonify({
-                "response": "Поняла, отменяю запись.\n\nМожет быть, у вас есть вопросы по лечению или имплантации? Также могу предложить вам скидку 30% на КТ по промокоду «Чат».\n\nВыберите тему или напишите свой вопрос:",
-                "session_id": session_id,
-                "action_buttons": [
-                    {"text": "Узнать про имплантацию", "action": "Узнать про имплантацию"},
-                    {"text": "КТ со скидкой", "action": "Получить скидку на КТ"}
-                ]
+                "response": "Хорошо, фиксирую. Если передумаете – я всегда на связи.",
+                "session_id": session_id
+            })
+        elif refusal_type == "soft":
+            session.clear()
+            return jsonify({
+                "response": "Понял, без спешки. Если появятся вопросы – подскажу.",
+                "session_id": session_id
             })
         
         session["имя"] = message
@@ -195,19 +230,36 @@ def chat():
 
     if session.get("state") == "ожидание_телефона":
         # Проверяем отказ
-        if is_cancellation(message):
+        refusal_type = is_cancellation(message)
+        if refusal_type == "hard":
             session.clear()
             return jsonify({
-                "response": "Поняла, отменяю запись.\n\nМожет быть, у вас есть вопросы по лечению или имплантации? Также могу предложить вам скидку 30% на КТ по промокоду «Чат».\n\nВыберите тему или напишите свой вопрос:",
-                "session_id": session_id,
-                "action_buttons": [
-                    {"text": "Узнать про имплантацию", "action": "Узнать про имплантацию"},
-                    {"text": "КТ со скидкой", "action": "Получить скидку на КТ"}
-                ]
+                "response": "Хорошо, фиксирую. Если передумаете – я всегда на связи.",
+                "session_id": session_id
+            })
+        elif refusal_type == "soft":
+            session.clear()
+            return jsonify({
+                "response": "Понял, без спешки. Если появятся вопросы – подскажу.",
+                "session_id": session_id
             })
         
         name = session.get("имя", "Не указано")
         phone = message
+        
+        # Валидация телефона
+        if not validate_phone(phone):
+            return jsonify({
+                "response": "Пожалуйста, введите корректный номер телефона (минимум 10 цифр).",
+                "session_id": session_id
+            })
+        
+        # Проверяем rate-limit на заявки
+        if not check_rate_limit(session_id):
+            return jsonify({
+                "response": "Заявка уже отправлена недавно. Мы скоро свяжемся.",
+                "session_id": session_id
+            })
         
         # Проверяем время работы клиники
         if is_clinic_open():
@@ -251,18 +303,32 @@ def chat():
     # --- Обычная обработка через RAG ---
     try:
         response, rag_meta = get_rag_answer(message)
-        session_messages[session_id].append({"role": "user", "content": message})
-        session_messages[session_id].append({"role": "assistant", "content": response})
         
         # Строим CTA
         cta = build_cta(rag_meta)
         
         # Rate-limit: не спамить (90-120 секунд)
         now = datetime.now()
+        throttled = False
         if cta and session.get("last_cta_ts") and (now - session["last_cta_ts"]).seconds < 90:
             cta = None
+            throttled = True
         if cta:
             session["last_cta_ts"] = now
+        
+        # Логируем запрос для анализа (после троттлинга CTA)
+        try:
+            from rag_engine import log_query_response
+            # Берем used_chunks из метаданных
+            used_chunks = rag_meta.get("used_chunks", [])
+            # Логируем shown_cta (какая CTA реально показана после троттлинга)
+            cta_final = cta if cta and not throttled else None
+            log_query_response(message, response, {**rag_meta, "shown_cta": bool(cta_final)}, used_chunks)
+        except Exception as e:
+            print(f"⚠️ Ошибка логирования: {e}")
+        
+        session_messages[session_id].append({"role": "user", "content": message})
+        session_messages[session_id].append({"role": "assistant", "content": response})
         
         return jsonify({
             "response": response,
@@ -284,8 +350,26 @@ def submit_lead():
     name = data.get('name', '')
     phone = data.get('phone', '')
     source = data.get('source', 'widget')
+    session_id = data.get('session_id', 'direct')
+    
+    # Проверяем отказ (если есть сообщение)
+    message = data.get('message', '')
+    if message:
+        refusal_type = is_cancellation(message)
+        if refusal_type:
+            return jsonify({
+                "success": False, 
+                "message": "Понял, отменяю заявку." if refusal_type == "hard" else "Понял, без спешки."
+            })
     
     if name and phone:
+        # Проверяем rate-limit
+        if not check_rate_limit(session_id):
+            return jsonify({
+                "success": False, 
+                "message": "Заявка уже отправлена недавно. Мы скоро свяжемся."
+            })
+        
         try:
             send_lead_email(name, phone)
             return jsonify({"success": True, "message": "Заявка успешно отправлена!"})
