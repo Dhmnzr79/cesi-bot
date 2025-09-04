@@ -1,0 +1,19 @@
+# config/empathy_config.yaml — конфигурация системы эмпатии
+# "triggers" | "llm" | "hybrid"
+
+mode: "hybrid"
+min_confidence: 0.55
+max_phrases: 2
+skip_opener_probability: 0.2
+
+# Категории эмоций (можно расширять без изменения кода)
+emotion_categories: ["pain", "price", "trust", "consultation", "osseointegration", "safety", "none"]
+
+topics:
+  blocked_soft: ["prices", "contacts", "warranty", "contraindications"]
+  blocked_hard: ["legal", "insurance_terms"]
+
+override:
+  allow_on_soft_block: true
+  llm_min_confidence: 0.75
+  triggers_allow_override: true

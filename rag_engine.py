@@ -7,12 +7,14 @@ import yaml
 import re
 import json
 import difflib
+import random
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Any, Set, Tuple
 from textwrap import dedent
 from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz
+from core.empathy import detect_emotion, build_answer
 
 # ==== КОНСТАНТЫ ====
 CONFIG_DIR = Path("config")
@@ -65,6 +67,15 @@ def _slugify_implant_kind(name: str) -> str:
     return re.sub(r'[^a-z0-9\-]+', '-', n)  # unidecode(n) - опционально
 
 load_dotenv()
+
+# Загрузка конфигов эмпатии
+with open(os.path.join("config", "empathy_config.yaml"), "r", encoding="utf-8") as f:
+    EMPATHY_CFG = yaml.safe_load(f)
+with open(os.path.join("config","empathy.yaml"), "r", encoding="utf-8") as f:
+    EMPATHY_BANK = yaml.safe_load(f)
+with open(os.path.join("config", "empathy_triggers.yaml"), "r", encoding="utf-8") as f:
+    EMPATHY_TRIGGERS = yaml.safe_load(f)
+_RNG = random.Random()
 
 # Инициализация OpenAI клиента v1
 try:
@@ -691,6 +702,55 @@ def get_embedding(text: str) -> List[float]:
         # Возвращаем нулевой вектор
         return [0.0] * 1536
 
+def generate_query_variants(query: str) -> List[str]:
+    """Генерирует 2-3 варианта перефразировки запроса для лучшего поиска"""
+    if not openai_client:
+        return [query]  # Fallback к исходному запросу
+    
+    prompt = f"""Перефразируй вопрос пациента о стоматологии в 2-3 разных варианта для поиска информации.
+
+Исходный вопрос: "{query}"
+
+Создай варианты:
+1. Более формальный/медицинский
+2. Более простой/бытовой  
+3. С синонимами и альтернативными формулировками
+
+Верни ТОЛЬКО JSON:
+{{"variants": ["вариант 1", "вариант 2", "вариант 3"]}}
+
+Примеры:
+- "больно ли ставить имплант" → ["болезненность имплантации", "дискомфорт при установке импланта", "ощущения во время имплантации"]
+- "сколько стоит имплантация" → ["стоимость имплантации зубов", "цена на импланты", "расценки на имплантацию"]"""
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+            temperature=0.3
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        variants = result.get("variants", [])
+        
+        # Добавляем исходный запрос в начало
+        all_variants = [query] + variants
+        # Убираем дубликаты, сохраняя порядок
+        unique_variants = []
+        seen = set()
+        for variant in all_variants:
+            if variant.lower() not in seen:
+                unique_variants.append(variant)
+                seen.add(variant.lower())
+        
+        print(f"🔍 Multi-query: сгенерировано {len(unique_variants)} вариантов запроса")
+        return unique_variants[:3]  # Максимум 3 варианта
+        
+    except Exception as e:
+        print(f"❌ Ошибка генерации вариантов запроса: {e}")
+        return [query]  # Fallback к исходному запросу
+
 def hybrid_retriever(query: str, top_n: int = 20) -> List[Tuple[RetrievedChunk, float]]:
     """Гибридный ретривер: объединяет BM25 и эмбеддинги"""
     if not all_chunks or len(all_chunks) == 0:
@@ -744,38 +804,91 @@ def hybrid_retriever(query: str, top_n: int = 20) -> List[Tuple[RetrievedChunk, 
     unique_candidates.sort(key=lambda x: x[1], reverse=True)
     return unique_candidates[:top_n]
 
+def llm_rerank(candidates: List[Tuple[RetrievedChunk, float]], query: str) -> List[Tuple[RetrievedChunk, float]]:
+    """LLM-реранкинг для точной оценки релевантности чанков"""
+    if not candidates or not openai_client:
+        return candidates
+    
+    # Берем только top-6 кандидатов для реранкинга
+    top_candidates = candidates[:6]
+    
+    # Формируем промпт для LLM
+    chunks_text = ""
+    for i, (chunk, score) in enumerate(top_candidates):
+        # Берем только заголовок и первые 200 символов для экономии токенов
+        header_match = re.search(r'(?m)^##\s+(.+?)\s*$', chunk.text)
+        header = header_match.group(1) if header_match else "Без заголовка"
+        preview = chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text
+        chunks_text += f"{i+1}. Заголовок: {header}\nТекст: {preview}\n\n"
+    
+    prompt = f"""Оцени релевантность каждого фрагмента для ответа на вопрос пользователя.
+
+Вопрос: "{query}"
+
+Фрагменты:
+{chunks_text}
+
+Верни ТОЛЬКО JSON с оценками от 0.0 до 1.0:
+{{"scores": [0.8, 0.3, 0.9, 0.1, 0.7, 0.2]}}
+
+Где 1.0 = максимально релевантно, 0.0 = не релевантно."""
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100,
+            temperature=0.1
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        llm_scores = result.get("scores", [])
+        
+        # Применяем LLM-оценки к кандидатам
+        reranked = []
+        for i, (chunk, base_score) in enumerate(top_candidates):
+            if i < len(llm_scores):
+                # Комбинируем базовый score с LLM-оценкой (70% LLM, 30% базовый)
+                final_score = llm_scores[i] * 0.7 + base_score * 0.3
+                reranked.append((chunk, final_score))
+            else:
+                reranked.append((chunk, base_score))
+        
+        # Сортируем по финальному score
+        reranked.sort(key=lambda x: x[1], reverse=True)
+        print(f"🔍 LLM-реранкинг: {len(reranked)} кандидатов переоценены")
+        
+        return reranked
+        
+    except Exception as e:
+        print(f"❌ Ошибка LLM-реранкинга: {e}")
+        return candidates
+
 def reranker(candidates: List[Tuple[RetrievedChunk, float]], query: str, detected_topics: Set[str]) -> List[RetrievedChunk]:
-    """Реранкер с эвристическим скорингом"""
+    """Реранкер с LLM-оценкой релевантности"""
     if not candidates:
         return []
     
+    # Сначала применяем LLM-реранкинг
+    llm_reranked = llm_rerank(candidates, query)
+    
+    # Затем применяем эвристические бонусы
     scored_candidates = []
     query_lower = query.lower()
     
-    for chunk, base_score in candidates:
+    for chunk, base_score in llm_reranked:
         final_score = base_score
         
-        # +1.0 если в заголовке ## есть ключевое слово/алиас из вопроса
-        header_match = re.search(r'(?m)^##\s+(.+?)\s*$', chunk.text)
-        if header_match:
-            header = header_match.group(1).lower()
-            # Проверяем ключевые слова из запроса
-            query_words = [word for word in query_lower.split() if len(word) > 3]
-            for word in query_words:
-                if word in header:
-                    final_score += 1.0
-                    break
-        
-        # +0.3 если тема от router совпала с темой чанка
+        # +0.2 если тема от router совпала с темой чанка
         if detected_topics and chunk.metadata.topic:
             if chunk.metadata.topic in detected_topics:
-                final_score += 0.3
+                final_score += 0.2
         
-        # +0.2 если найден alias через ENTITY_INDEX
+        # +0.1 если найден alias через ENTITY_INDEX
         for alias, meta in ENTITY_INDEX.items():
             if alias in query_lower:
                 if meta["doc_id"] == chunk.file_name:
-                    final_score += 0.2
+                    final_score += 0.1
                     break
         
         scored_candidates.append((chunk, final_score))
@@ -789,7 +902,7 @@ def reranker(candidates: List[Tuple[RetrievedChunk, float]], query: str, detecte
 
 
 def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]:
-    """Извлекает релевантные чанки с улучшенным ранжированием"""
+    """Извлекает релевантные чанки с multi-query rewrite и улучшенным ранжированием"""
     if len(all_chunks) == 0:
         print("⚠️ Нет чанков для поиска")
         return []
@@ -845,12 +958,34 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
     try:
         print(f"🔍 Поиск: '{query}' в {len(all_chunks)} чанках")
         
-        # ==== ГИБРИДНЫЙ РЕТРИВЕР ====
-        candidates = hybrid_retriever(query, top_n=20)
-        print(f"🔍 Гибридный ретривер нашел {len(candidates)} кандидатов")
+        # ==== MULTI-QUERY REWRITE ====
+        query_variants = generate_query_variants(query)
+        print(f"🔍 Multi-query: используем {len(query_variants)} вариантов запроса")
+        
+        # ==== ГИБРИДНЫЙ РЕТРИВЕР ДЛЯ КАЖДОГО ВАРИАНТА ====
+        all_candidates = []
+        for variant in query_variants:
+            candidates = hybrid_retriever(variant, top_n=15)  # Меньше кандидатов на вариант
+            all_candidates.extend(candidates)
+            print(f"🔍 Вариант '{variant[:30]}...': найдено {len(candidates)} кандидатов")
+        
+        # ==== ОБЪЕДИНЕНИЕ И ДЕДУПЛИКАЦИЯ ====
+        seen_chunks = set()
+        unique_candidates = []
+        
+        for chunk, score in all_candidates:
+            if chunk.id not in seen_chunks:
+                seen_chunks.add(chunk.id)
+                unique_candidates.append((chunk, score))
+        
+        # Сортируем по score и берем top
+        unique_candidates.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = unique_candidates[:25]  # Больше кандидатов для реранкинга
+        
+        print(f"🔍 Multi-query: объединено {len(unique_candidates)} уникальных кандидатов")
         
         # ==== РЕРАНКЕР ====
-        final_chunks = reranker(candidates, query, detected_topics)
+        final_chunks = reranker(top_candidates, query, detected_topics)
         print(f"🔍 Реранкер отобрал {len(final_chunks)} финальных чанков")
         
         # если ничего внятного не попало и тема известна — жёсткий fallback
@@ -1017,6 +1152,51 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str) -> SynthJSO
             warnings=["JSON parsing error"]
         )
 
+def compress_answer(text: str, max_length: int = 800) -> str:
+    """Сжимает длинный ответ до указанной длины без потери ключевой информации"""
+    if len(text) <= max_length or not openai_client:
+        return text
+    
+    # Считаем количество предложений
+    sentences = re.split(r'[.!?]+', text)
+    if len(sentences) <= 3:
+        return text  # Если мало предложений, не сжимаем
+    
+    prompt = f"""Сожми этот ответ о стоматологии до {max_length} символов, сохранив ВСЕ важные факты и цифры.
+
+ВАЖНО:
+- Сохрани ВСЕ числа, проценты, сроки, цены
+- Сохрани ключевую медицинскую информацию
+- Убери только "воду" и повторения
+- Оставь структуру: короткий ответ + детали + призыв к действию
+
+Исходный ответ:
+{text}
+
+Сжатый ответ:"""
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.1
+        )
+        
+        compressed = response.choices[0].message.content.strip()
+        
+        # Проверяем, что сжатие не слишком агрессивное
+        if len(compressed) < max_length * 0.5:
+            print(f"⚠️ Сжатие слишком агрессивное, возвращаем исходный текст")
+            return text
+        
+        print(f"🔍 Answer compression: {len(text)} → {len(compressed)} символов")
+        return compressed
+        
+    except Exception as e:
+        print(f"❌ Ошибка сжатия ответа: {e}")
+        return text
+
 def render_markdown(synth: SynthJSON) -> str:
     """Рендерит JSON в красивый Markdown без служебных заголовков"""
     
@@ -1097,6 +1277,53 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     # Рендерим в Markdown
     markdown_response = render_markdown(synth_response)
     
+    # ==== ЭМПАТИЯ ====
+    # Определяем эмоцию на основе запроса и контекста
+    retrieved_snippet = "\n".join([ch.text[:200] for ch in relevant_chunks[:3]])
+    fm = {}
+    if relevant_chunks:
+        try:
+            meta = relevant_chunks[0].metadata
+            fm = {
+                "emotion": getattr(meta, "emotion", None),
+                "verbatim": getattr(meta, "verbatim", False),
+                "doc_type": getattr(meta, "doc_type", None)
+            }
+        except Exception:
+            pass
+    
+    emotion, detector, confidence = detect_emotion(
+        user_query=user_message,
+        retrieved_snippet=retrieved_snippet,
+        fm=fm,
+        empathy_cfg=EMPATHY_CFG,
+        triggers_bank=EMPATHY_TRIGGERS,
+        llm_client=openai_client,
+        model="gpt-4o-mini"
+    )
+    
+    # Собираем финальный текст с эмпатией
+    core_text = markdown_response
+    
+    # Сначала добавляем openers/closers
+    text_with_empathy = build_answer(core_text, emotion, EMPATHY_BANK, EMPATHY_CFG, _RNG)
+    
+    # Затем применяем LLM-переформулировку для более естественного звучания
+    if emotion != "none" and openai_client:
+        try:
+            final_text = postprocess_answer_with_empathy(
+                base_text=text_with_empathy,
+                tone="friendly",
+                emotion=emotion,
+                cta_text=cta_text,
+                cta_link=cta_link
+            )
+        except Exception as e:
+            print(f"⚠️ LLM-переформулировка не сработала: {e}")
+            final_text = text_with_empathy
+    else:
+        final_text = text_with_empathy
+    
     # Постпроцессор: не даём «пустых» ответов
     if not relevant_chunks or len(markdown_response.strip()) < 40:
         print(f"⚠️ Пустой ответ, пробуем тематический fallback...")
@@ -1113,20 +1340,14 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
             else:
                 print(f"❌ Fallback не сработал для темы: {theme_key}")
     
-    # Постпроцессор для добавления эмпатии и эмодзи
-    # достанем тон/эмоцию/СТА из первого релевантного мета (если есть)
-    tone = "friendly"
-    emotion = "empathy"
+    # Собираем метаданные из первого чанка для CTA
+    rag_meta = {}
     cta_text = None
     cta_link = None
     
-    # Собираем метаданные из первого чанка
-    rag_meta = {}
     for ch in relevant_chunks:
         try:
             meta = ch.metadata
-            if getattr(meta, "tone", None): tone = meta.tone
-            if getattr(meta, "emotion", None): emotion = meta.emotion
             if getattr(meta, "cta_text", None): cta_text = meta.cta_text
             if getattr(meta, "cta_link", None): cta_link = meta.cta_link
             
@@ -1143,24 +1364,12 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
         except Exception:
             pass
     
-    # Применяем постпроцессор только если не verbatim и не сухая тема
-    if relevant_chunks and not getattr(relevant_chunks[0].metadata, 'verbatim', False):
-        # Байпас для сухих тем
-        if (tone or "").lower() == "strict" or (emotion or "").lower() == "none":
-            final_text = markdown_response  # без "обволакивания"
-        else:
-            final_text = postprocess_answer_with_empathy(
-                base_text=markdown_response,
-                tone=tone,
-                emotion=emotion or "empathy",
-                cta_text=cta_text,
-                cta_link=cta_link
-            )
-    else:
-        final_text = markdown_response
-    
     # Применяем анти-флуфф фильтр к финальному тексту
     final_text = strip_fluff_start(final_text)
+    
+    # ==== ANSWER COMPRESSION ====
+    if len(final_text) > 800:  # Сжимаем только длинные ответы
+        final_text = compress_answer(final_text, max_length=800)
     
     # Отладочная информация
     print(f"🔍 Вопрос: '{user_message}'")
@@ -1172,6 +1381,15 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     # Добавляем used_chunks в метаданные
     used_ids = [ch.id for ch in relevant_chunks]
     rag_meta["used_chunks"] = used_ids
+    
+    # Добавляем поля эмпатии в метаданные
+    rag_meta.update({
+        "emotion": emotion,
+        "detector": detector,
+        "confidence": round(float(confidence), 2),
+        "opener_used": (emotion != "none" and any(final_text.startswith(x) for x in EMPATHY_BANK.get(emotion, {}).get("openers", []))),
+        "closer_used": (emotion != "none" and any(final_text.endswith(x) for x in EMPATHY_BANK.get(emotion, {}).get("closers", [])))
+    })
     
     print(f"📋 Метаданные: {rag_meta}")
     
@@ -1191,7 +1409,13 @@ def log_query_response(user_message: str, response: str, metadata: dict, chunks_
         "answer_length": len(response),
         "has_cta": bool(metadata.get("cta_action")),
         "topic": metadata.get("topic", "unknown"),
-        "doc_type": metadata.get("doc_type", "unknown")
+        "doc_type": metadata.get("doc_type", "unknown"),
+        # Поля эмпатии для отладки
+        "emotion": metadata.get("emotion", "none"),
+        "emotion_source": metadata.get("detector", "unknown"),
+        "emotion_confidence": metadata.get("confidence", 0.0),
+        "opener_used": metadata.get("opener_used", False),
+        "closer_used": metadata.get("closer_used", False)
     }
     
     try:
