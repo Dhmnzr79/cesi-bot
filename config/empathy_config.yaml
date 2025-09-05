@@ -2,12 +2,22 @@
 # "triggers" | "llm" | "hybrid"
 
 mode: "hybrid"
-min_confidence: 0.55
-max_phrases: 2
-skip_opener_probability: 0.2
+min_confidence: 0.65
+max_phrases: 1
+skip_opener_probability: 0.6
 
 # Категории эмоций (можно расширять без изменения кода)
 emotion_categories: ["pain", "price", "trust", "consultation", "osseointegration", "safety", "none"]
+
+# SAFE-режим: рубильники функций
+features:
+  empathy_enabled: true
+  postprocess_enabled: true
+  cta_enabled: true
+
+  disable_empathy_on_doc_types: ["contacts", "prices", "warranty", "contraindications", "clinic", "doctors"]
+  disable_postprocess_on_doc_types: ["contacts", "prices", "warranty", "contraindications", "clinic", "doctors"]
+  disable_cta_on_doc_types: ["contacts", "prices", "warranty", "contraindications"]
 
 topics:
   blocked_soft: ["prices", "contacts", "warranty", "contraindications"]
@@ -15,5 +25,5 @@ topics:
 
 override:
   allow_on_soft_block: true
-  llm_min_confidence: 0.75
+  llm_min_confidence: 0.80
   triggers_allow_override: true

@@ -168,7 +168,14 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
         # Если внутри есть Н3 режем по ним (### ...)
         h3_blocks = re.split(r'(?m)^\s*###\s+', block)
         if len(h3_blocks) > 1:
-            # первый элемент до первого ### это сам h2 заголовок, его пропустим
+            # parts[0] — содержимое до первого ### <- ЭТО НУЖНО СОХРАНИТЬ!
+            if h3_blocks[0].strip():
+                preamble_text = f"## {h2_title}\n{h3_blocks[0].strip()}"
+                chunk_id = f"{file_name}#{h2_title}_preamble"
+                temp_metadata = Frontmatter({})
+                chunks.append(RetrievedChunk(chunk_id, preamble_text.strip(), temp_metadata, file_name))
+            
+            # дальше создать чанки для каждого ### как сейчас
             for h3 in h3_blocks[1:]:
                 h3 = h3.strip()
                 if not h3:
@@ -193,15 +200,13 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
 
 def extract_aliases_from_chunk(chunk_text: str) -> List[str]:
     """Извлекает алиасы из HTML-комментариев в чанке"""
-    aliases = []
-    
-    # Ищем <!-- aliases: [...] -->
-    alias_match = re.search(r'<!--\s*aliases:\s*\[(.*?)\]\s*-->', chunk_text)
-    if alias_match:
-        alias_text = alias_match.group(1)
-        aliases = [alias.strip() for alias in alias_text.split(',') if alias.strip()]
-    
-    return aliases
+    m = re.search(r'<!--\s*aliases:\s*\[(.*?)\]\s*-->', chunk_text, re.S)
+    if not m:
+        return []
+    raw = m.group(1)
+    pairs = re.findall(r'"([^"]+)"|\'([^\']+)\'', raw)
+    aliases = [a or b for a, b in pairs]
+    return [a.strip() for a in aliases if a and a.strip()]
 
 def update_entity_index(chunk: RetrievedChunk, topic: str, entity_key: str):
     """Обновляет ENTITY_INDEX с алиасами из чанка"""
@@ -1012,7 +1017,7 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
         print(f"❌ Ошибка при поиске чанков: {e}")
         return []
 
-def synthesize_answer(chunks: List[RetrievedChunk], user_query: str) -> SynthJSON:
+def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, allow_cta: bool) -> SynthJSON:
     """Синтезирует структурированный JSON ответ"""
     
     # Формируем контекст из чанков
@@ -1029,6 +1034,9 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str) -> SynthJSO
     tone = primary_chunk.metadata.tone if primary_chunk else "friendly"
     preferred_format = primary_chunk.metadata.preferred_format if primary_chunk else ["short", "bullets", "cta"]
     verbatim = primary_chunk.metadata.verbatim if primary_chunk else False
+    
+    # CTA для промпта (только если разрешен)
+    cta_for_prompt = (primary_chunk.metadata.cta_text if (primary_chunk and allow_cta) else "")
     
     # Системный промпт с учетом verbatim
     if verbatim:
@@ -1055,7 +1063,7 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str) -> SynthJSO
 ## Метаданные:
 - Тон: {tone}
 - Предпочтительный формат: {preferred_format}
-- CTA текст: {primary_chunk.metadata.cta_text if primary_chunk else 'Записаться на консультацию'}
+{f"- CTA текст: {cta_for_prompt}" if cta_for_prompt else ""}
 
 Отвечай строго в формате JSON:
 {{
@@ -1104,7 +1112,7 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str) -> SynthJSO
 ## Метаданные:
 - Тон: {tone}
 - Предпочтительный формат: {preferred_format}
-- CTA текст: {primary_chunk.metadata.cta_text if primary_chunk else 'Записаться на консультацию'}
+{f"- CTA текст: {cta_for_prompt}" if cta_for_prompt else ""}
 
 ВАЖНО: Если вопрос о враче или сотруднике клиники, отвечай только по базе. Если данных нет, скажи, что информации нет, без предположений.
 
@@ -1133,10 +1141,13 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str) -> SynthJSO
     
     try:
         json_response = json.loads(completion.choices[0].message.content)
+        result_cta = json_response.get("cta", "")
+        if not allow_cta:
+            result_cta = ""
         return SynthJSON(
             short=json_response.get("short", ""),
             bullets=json_response.get("bullets", []),
-            cta=json_response.get("cta", ""),
+            cta=result_cta,
             used_chunks=json_response.get("used_chunks", []),
             tone=json_response.get("tone", tone),
             warnings=json_response.get("warnings", [])
@@ -1271,8 +1282,17 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
 
 Запишитесь на бесплатную консультацию — наш специалист ответит на все ваши вопросы.""", {}
     
+    # Сразу после получения relevant_chunks вычисляем флаги разрешений
+    primary_chunk = relevant_chunks[0] if relevant_chunks else None
+    doc_type = (primary_chunk.metadata.doc_type if primary_chunk else "info")
+    _cfg = EMPATHY_CFG.get("features", {})
+
+    allow_cta       = _cfg.get("cta_enabled", True) and doc_type not in set(_cfg.get("disable_cta_on_doc_types", []))
+    allow_post      = _cfg.get("postprocess_enabled", True) and doc_type not in set(_cfg.get("disable_postprocess_on_doc_types", []))
+    allow_empathy   = _cfg.get("empathy_enabled", True) and doc_type not in set(_cfg.get("disable_empathy_on_doc_types", []))
+    
     # Синтезируем структурированный ответ
-    synth_response = synthesize_answer(relevant_chunks, user_message)
+    synth_response = synthesize_answer(relevant_chunks, user_message, allow_cta)
     
     # Рендерим в Markdown
     markdown_response = render_markdown(synth_response)
@@ -1305,24 +1325,22 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     # Собираем финальный текст с эмпатией
     core_text = markdown_response
     
-    # Сначала добавляем openers/closers
-    text_with_empathy = build_answer(core_text, emotion, EMPATHY_BANK, EMPATHY_CFG, _RNG)
+    # --- CTA
+    cta_text = primary_chunk.metadata.cta_text if primary_chunk else None
+    cta_link = primary_chunk.metadata.cta_link if primary_chunk else None
+    if not allow_cta:
+        cta_text, cta_link = None, None
     
-    # Затем применяем LLM-переформулировку для более естественного звучания
-    if emotion != "none" and openai_client:
-        try:
-            final_text = postprocess_answer_with_empathy(
-                base_text=text_with_empathy,
-                tone="friendly",
-                emotion=emotion,
-                cta_text=cta_text,
-                cta_link=cta_link
-            )
-        except Exception as e:
-            print(f"⚠️ LLM-переформулировка не сработала: {e}")
-            final_text = text_with_empathy
-    else:
-        final_text = text_with_empathy
+    # --- Postprocess
+    final_text = core_text
+    if allow_post:
+        final_text = postprocess_answer_with_empathy(
+            base_text=core_text, tone="friendly", emotion=emotion, cta_text=cta_text, cta_link=cta_link
+        )
+    
+    # --- Empathy
+    if allow_empathy:
+        final_text = build_answer(final_text, emotion, EMPATHY_BANK, EMPATHY_CFG, _RNG)
     
     # Постпроцессор: не даём «пустых» ответов
     if not relevant_chunks or len(markdown_response.strip()) < 40:
@@ -1388,7 +1406,11 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
         "detector": detector,
         "confidence": round(float(confidence), 2),
         "opener_used": (emotion != "none" and any(final_text.startswith(x) for x in EMPATHY_BANK.get(emotion, {}).get("openers", []))),
-        "closer_used": (emotion != "none" and any(final_text.endswith(x) for x in EMPATHY_BANK.get(emotion, {}).get("closers", [])))
+        "closer_used": (emotion != "none" and any(final_text.endswith(x) for x in EMPATHY_BANK.get(emotion, {}).get("closers", []))),
+        # SAFE-режим статусы
+        "empathy_enabled": allow_empathy,
+        "postprocess_enabled": allow_post,
+        "cta_enabled": allow_cta
     })
     
     print(f"📋 Метаданные: {rag_meta}")
