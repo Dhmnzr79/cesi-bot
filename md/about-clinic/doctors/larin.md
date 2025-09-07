@@ -1,14 +1,17 @@
 ---
 title: "Ларин Кирилл Евгеньевич"
-aliases: ["ларин кирилл евгеньевич","ларин стоматолог","ларин протезирование","ларин имплантация","врач ларин"]
-topic: "clinic"
-doc_type: "doctor"
-preferred_format: "short"
+doc_type: "doctors"
+topic: "doctors"
+verbatim: true
+aliases:
+  - "ларин кирилл евгеньевич"
+  - "ларин стоматолог"
+  - "ларин протезирование"
+  - "ларин имплантация"
+  - "врач ларин"
+preferred_format: ["short","bullets"]
 cta_action: "consultation_doctor"
 cta_text: "Познакомиться с врачом на консультации"
-verbatim: true
-tone: "confident"
-emotion: "trust"
 updated: "2025-09-03"
 ---
 

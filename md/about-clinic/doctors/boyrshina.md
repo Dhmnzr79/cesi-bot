@@ -1,14 +1,17 @@
 ---
 title: "Бояршина Ирина Юрьевна"
-aliases: ["бояршина ирина юрьевна","бояршина терапевт","бояршина стоматолог","врач бояршина","бояршина протезирование"]
-topic: "clinic"
-doc_type: "doctor"
-preferred_format: "short"
+doc_type: "doctors"
+topic: "doctors"
+verbatim: true
+aliases:
+  - "бояршина ирина юрьевна"
+  - "бояршина терапевт"
+  - "бояршина стоматолог"
+  - "врач бояршина"
+  - "бояршина протезирование"
+preferred_format: ["short","bullets"]
 cta_action: "consultation_doctor"
 cta_text: "Познакомиться с врачом на консультации"
-verbatim: true
-tone: "confident"
-emotion: "trust"
 updated: "2025-09-03"
 ---
 

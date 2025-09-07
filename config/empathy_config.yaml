@@ -15,12 +15,12 @@ features:
   postprocess_enabled: true
   cta_enabled: true
 
-  disable_empathy_on_doc_types: ["contacts", "prices", "warranty", "contraindications", "clinic", "doctors"]
-  disable_postprocess_on_doc_types: ["contacts", "prices", "warranty", "contraindications", "clinic", "doctors"]
-  disable_cta_on_doc_types: ["contacts", "prices", "warranty", "contraindications"]
+  disable_empathy_on_doc_types: ["contacts", "prices", "warranty", "contraindications", "clinic", "doctors", "implants", "consultation"]
+  disable_postprocess_on_doc_types: ["contacts", "prices", "warranty", "contraindications", "clinic", "doctors", "implants", "consultation"]
+  disable_cta_on_doc_types: ["contacts", "prices", "warranty", "contraindications", "implants", "consultation"]
 
 topics:
-  blocked_soft: ["prices", "contacts", "warranty", "contraindications"]
+  blocked_soft: ["prices", "contacts", "warranty", "contraindications", "implants", "consultation"]
   blocked_hard: ["legal", "insurance_terms"]
 
 override:

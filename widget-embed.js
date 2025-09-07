@@ -622,20 +622,21 @@
                     session_id: window.cesiSessionId
                 })
             })
-            .then(response => {
-                console.log('Ответ сервера:', response.status);
-                if (!response.ok) {
-                    throw new Error('HTTP ' + response.status);
+            .then(resp => {
+                console.log('Ответ сервера:', resp.status);
+                if (!resp.ok) {
+                    throw new Error('HTTP ' + resp.status);
                 }
-                return response.json();
+                const ct = (resp.headers.get('content-type') || '').toLowerCase();
+                if (ct.includes('application/json')) return resp.json();
+                return resp.text().then(t => ({ response: t })); // обернули plain text
             })
             .then(data => {
-                console.log('Данные ответа:', data);
+                console.log('[BOT] response data:', data); // оставь для отладки
                 // Скрываем индикатор печати
                 cesiHideTypingIndicator();
-                if (data.response) {
-                    cesiAppendMessage('bot', data.response);
-                }
+                const text = data.response ?? (data.answer && data.answer.short) ?? data.text ?? data.message ?? '';
+                if (text) cesiAppendMessage('bot', String(text));
                 
                 // Сбрасываем таймер неактивности после ответа бота
                 cesiResetInactivityTimer();
@@ -690,20 +691,21 @@
                 session_id: window.cesiSessionId
             })
         })
-        .then(response => {
-            console.log('Ответ сервера:', response.status);
-            if (!response.ok) {
-                throw new Error('HTTP ' + response.status);
+        .then(resp => {
+            console.log('Ответ сервера:', resp.status);
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
             }
-            return response.json();
+            const ct = (resp.headers.get('content-type') || '').toLowerCase();
+            if (ct.includes('application/json')) return resp.json();
+            return resp.text().then(t => ({ response: t })); // обернули plain text
         })
         .then(data => {
-            console.log('Данные ответа:', data);
+            console.log('[BOT] response data:', data); // оставь для отладки
             // Скрываем индикатор печати
             cesiHideTypingIndicator();
-            if (data.response) {
-                cesiAppendMessage('bot', data.response);
-            }
+            const text = data.response ?? (data.answer && data.answer.short) ?? data.text ?? data.message ?? '';
+            if (text) cesiAppendMessage('bot', String(text));
             
             // Сбрасываем таймер неактивности после ответа бота
             cesiResetInactivityTimer();
@@ -1060,18 +1062,20 @@
                  session_id: window.cesiSessionId
              })
          })
-         .then(response => {
-             if (!response.ok) {
-                 throw new Error('HTTP ' + response.status);
+         .then(resp => {
+             if (!resp.ok) {
+                 throw new Error('HTTP ' + resp.status);
              }
-             return response.json();
+             const ct = (resp.headers.get('content-type') || '').toLowerCase();
+             if (ct.includes('application/json')) return resp.json();
+             return resp.text().then(t => ({ response: t })); // обернули plain text
          })
          .then(data => {
+             console.log('[BOT] response data:', data); // оставь для отладки
              // Скрываем индикатор печати
              cesiHideTypingIndicator();
-             if (data.response) {
-                 cesiAppendMessage('bot', data.response);
-             }
+             const text = data.response ?? (data.answer && data.answer.short) ?? data.text ?? data.message ?? '';
+             if (text) cesiAppendMessage('bot', String(text));
              
              // Сбрасываем таймер неактивности после ответа бота
              cesiResetInactivityTimer();

@@ -36,6 +36,26 @@ ANTI_FLUFF = [
 # ==== ГЛОБАЛЬНЫЕ СТРУКТУРЫ ДЛЯ КАТАЛОГА СУЩНОСТЕЙ ====
 ENTITY_INDEX = {}  # alias_norm -> {"topic": str, "entity": str, "doc_id": str, "section": str}
 ENTITY_CHUNKS = {}  # (topic, entity) -> RetrievedChunk
+ALIAS_MAP = {}  # normalize(alias) -> {"file": path, "primary_h2_id": ...}
+
+# ==== НОВАЯ АРХИТЕКТУРА ИНДЕКСОВ ====
+# === 1) Нормализация тем ===
+CANON = {"doctors","consultation","prices","warranty","contacts","implants","safety","clinic"}
+
+def norm_topic(x: str) -> str:
+    return (x or "").strip().lower()
+
+def norm_text(x: str) -> str:
+    import unicodedata
+    x = unicodedata.normalize("NFKD", (x or "").lower().strip())
+    x = re.sub(r"\s+", " ", x)
+    return x
+
+# === 2) Контейнеры индексов ===
+ALIAS_MAP_GLOBAL = {}   # norm(alias) -> {"topic":..., "file":...}
+H2_INDEX = {}           # norm(h2_text/h2_id/local_alias) -> {"topic":..., "file":..., "h2_id":...}
+FILE_META = {}          # file -> {"topic":..., "aliases": [...], "mini_links":[...]}
+ALL_CHUNKS = []         # ваши чанк-объекты (как и раньше)
 
 # ==== BM25 ИНДЕКС ====
 bm25_index = None
@@ -95,6 +115,7 @@ class Frontmatter:
         self.doc_type = data.get('doc_type', 'info')
         self.topic = data.get('topic', '')
         self.tags = data.get('tags', [])
+        self.aliases = data.get('aliases', [])  # ✅ Добавляем aliases
         self.audience = data.get('audience', '')
         self.updated = data.get('updated', '')
         self.locale = data.get('locale', 'ru-RU')
@@ -131,6 +152,93 @@ class SynthJSON:
         self.used_chunks = used_chunks
         self.tone = tone
         self.warnings = warnings or []
+
+# === 3) Парс MD ===
+RX_H2 = re.compile(r"(?m)^##\s+([^\n{]+?)(?:\s*\{#([^\}]+)\})?\s*$")
+RX_LOC = re.compile(r"<!--\s*aliases:\s*\[(.*?)\]\s*-->", re.S|re.I)
+
+def parse_frontmatter(text: str):
+    if not text.startswith("---"): return {}, text
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.S)
+    if not m: return {}, text
+    fm = yaml.safe_load(m.group(1)) or {}
+    body = m.group(2)
+    return fm, body
+
+def parse_h2_sections(body: str):
+    sections = []
+    for m in RX_H2.finditer(body):
+        title = m.group(1).strip()
+        h2_id = m.group(2) or slugify(title)
+        tail = body[m.end(): m.end()+400]
+        loc = RX_LOC.search(tail)
+        local_aliases = []
+        if loc:
+            raw = loc.group(1)
+            local_aliases = [a.strip().strip("'\"") for a in re.split(r",\s*", raw) if a.strip()]
+        sections.append({"title": title, "h2_id": h2_id, "local_aliases": local_aliases})
+    return sections
+
+def slugify(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s.lower().strip())
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9\-а-яё]", "", s)
+    return s
+
+# === 4) Регистрация индексов при загрузке файла ===
+def register_file(file_name: str, md_text: str):
+    fm, body = parse_frontmatter(md_text)
+    doc_type = norm_topic(fm.get("doc_type"))
+    topic = norm_topic(fm.get("topic") or doc_type)
+    if topic not in CANON:
+        topic = "clinic"  # fallback на clinic
+
+    aliases = fm.get("aliases") or []
+    if isinstance(aliases, str): aliases = [aliases]
+    mini_links = fm.get("mini_links") or []
+
+    FILE_META[file_name] = {"topic": topic, "aliases": aliases, "mini_links": mini_links}
+
+    # глобальные алиасы → файл/тема
+    for a in aliases:
+        ALIAS_MAP_GLOBAL[norm_text(a)] = {"topic": topic, "file": file_name}
+
+    # H2 и локальные алиасы → точный индекс
+    for s in parse_h2_sections(body):
+        # индексируем заголовок и h2_id
+        for key in [s["title"], s["h2_id"], *s["local_aliases"]]:
+            H2_INDEX[norm_text(key)] = {"topic": topic, "file": file_name, "h2_id": s["h2_id"]}
+
+# === 5) DEFAULT_H2 (страховка) ===
+DEFAULT_H2 = {
+  "consultation": ("consultation-free.md",         "обзор"),
+  "prices":       ("prices-clinic.md",             None),
+  "warranty":     ("warranty.md",                  "обзор"),
+  "contacts":     ("clinic-contacts.md",           None),
+  "implants":     ("implants-overview.md",         "обзор"),
+  "safety":       ("implants-contraindications.md","обзор"),
+  "doctors":      ("doctors.md",                   "обзор"),
+  "clinic":       ("advantages-general.md",        "обзор")
+}
+
+def _find_chunk(file_name: str, h2_id: str|None):
+    for ch in ALL_CHUNKS:
+        if ch.file_name == file_name:
+            if h2_id is None or getattr(ch.metadata, "h2_id", None) == h2_id:
+                return ch
+    return None
+
+def get_default_chunk_for_topic(topic: str):
+    file_name, h2_id = DEFAULT_H2.get(topic, (None, None))
+    if file_name:
+        ch = _find_chunk(file_name, h2_id)
+        if ch: return ch, {"source":"default","topic":topic,"exact_h2_match":bool(h2_id)}
+    # запасной путь — первый чанк этой темы
+    for ch in ALL_CHUNKS:
+        if getattr(ch.metadata, "topic", None) == topic:
+            return ch, {"source":"default-any","topic":topic,"exact_h2_match":False}
+    return None, {}
 
 def parse_yaml_front_matter(text: str):
     """Парсит YAML front matter из markdown файла"""
@@ -212,14 +320,14 @@ def update_entity_index(chunk: RetrievedChunk, topic: str, entity_key: str):
     """Обновляет ENTITY_INDEX с алиасами из чанка"""
     # Извлекаем заголовок ##
     header_match = re.search(r'(?m)^##\s+(.+?)\s*$', chunk.text)
-    if not header_match:
-        return
+    title = header_match.group(1).strip() if header_match else ""
     
-    title = header_match.group(1).strip()
-    
-    # Извлекаем алиасы
+    # Алиасы: HTML-коммент в тексте + фронтматтер
     aliases = extract_aliases_from_chunk(chunk.text)
-    aliases.append(title)  # Добавляем сам заголовок
+    if hasattr(chunk, "metadata") and getattr(chunk.metadata, "aliases", None):
+        aliases.extend(chunk.metadata.aliases)
+    if title:
+        aliases.append(title)
     
     # Индексируем все алиасы
     for alias in aliases:
@@ -531,13 +639,32 @@ try:
             text = file.read_text(encoding="utf-8")
             print(f"  📖 Прочитан файл: {file.name} ({len(text)} символов)")
             
+            # Регистрируем файл в новых индексах
+            register_file(file.name, text)
+            
             # Парсим YAML front matter
             metadata, content = parse_yaml_front_matter(text)
             content = _normalize(content) # нормализуем пробелы
             print(f"  ✅ YAML парсинг: {metadata.id if metadata.id else 'без ID'}")
             
+            # Регистрируем алиасы для fallback поиска
+            try:
+                from core.md_loader import register_aliases
+                # Конвертируем metadata в dict для register_aliases
+                frontmatter_dict = {
+                    "aliases": getattr(metadata, 'aliases', []),
+                    "primary_h2_id": getattr(metadata, 'primary_h2_id', None)
+                }
+                register_aliases(frontmatter_dict, str(file))
+            except Exception as e:
+                print(f"  ⚠️ Ошибка регистрации алиасов: {e}")
+            
+            # Локальная регистрация алиасов
+            for a in (getattr(metadata, 'aliases', ()) or []):
+                ALIAS_MAP[_norm(a)] = {"file": str(file), "primary_h2_id": getattr(metadata, 'primary_h2_id', None)}
+            
             # если это файл с врачами - собрать имена
-            if getattr(metadata, 'doc_type', '') == 'doctor' or file.name == "doctors.md":
+            if getattr(metadata, 'doc_type', '') in ('doctor', 'doctors') or file.name == "doctors.md":
                 found = _extract_doctor_names_from_text(content)
                 if found:
                     DOCTOR_NAME_TOKENS.update(found)
@@ -599,8 +726,11 @@ try:
                 
                 all_chunks.append(chunk)
                 
-                # Если это карточка врача (подзаголовок ### Имя Фамилия [Отчество]) — запоминаем прямую ссылку
-                hdr = re.search(r'(?m)^###\s+([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})\s*$', chunk.text)
+                # Регистрируем все чанки в ENTITY_CHUNKS (не только импланты)
+                ENTITY_CHUNKS[(chunk.metadata.topic or "general", chunk.id)] = chunk
+                
+                # Если это карточка врача (подзаголовок ## или ### Имя Фамилия [Отчество]) — запоминаем прямую ссылку
+                hdr = re.search(r'(?m)^#{2,3}\s+([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})\s*$', chunk.text)
                 if hdr:
                     full = hdr.group(1).strip()
                     parts = full.split()
@@ -631,6 +761,13 @@ try:
             continue
     
     print(f"\u23f3 Найдено {len(all_chunks)} чанков")
+    
+    # Инициализируем ALL_CHUNKS для новых индексов
+    ALL_CHUNKS.extend(all_chunks)
+    print(f"✅ ALL_CHUNKS инициализирован: {len(ALL_CHUNKS)} чанков")
+    print(f"✅ ALIAS_MAP_GLOBAL: {len(ALIAS_MAP_GLOBAL)} алиасов")
+    print(f"✅ H2_INDEX: {len(H2_INDEX)} заголовков")
+    print(f"✅ FILE_META: {len(FILE_META)} файлов")
     
     # Создаем BM25 индекс
     if all_chunks:
@@ -687,10 +824,9 @@ except Exception as e:
     print(f"❌ Критическая ошибка при инициализации: {e}")
     import traceback
     traceback.print_exc()
-    # Создаем пустой индекс для fallback
-    dimension = 1536
-    index = faiss.IndexFlatL2(dimension)
-    all_chunks = []
+    print("⚠️ Embeddings недоступны, работаем только на BM25 и правилах")
+    index = None
+    # нет FAISS, но чанки оставляем!
 
 # Fallback функция get_embedding
 def get_embedding(text: str) -> List[float]:
@@ -906,6 +1042,45 @@ def reranker(candidates: List[Tuple[RetrievedChunk, float]], query: str, detecte
 
 
 
+# === 6) Ранний детектор H2 ===
+def detect_section_early(user_q: str):
+    q = norm_text(user_q)
+    hit = H2_INDEX.get(q)
+    if not hit:
+        # мягкое вхождение (минимум 3 символа для избежания ложных срабатываний)
+        for k, v in H2_INDEX.items():
+            if k and len(k) > 2 and k in q:
+                hit = v; break
+    if not hit: return None, {}
+    ch = _find_chunk(hit["file"], hit["h2_id"])
+    if not ch: return None, {}
+    return ch, {"source":"alias","exact_h2_match":True,"topic":hit["topic"]}
+
+# === 7) Главная функция ретрива ===
+def retrieve_relevant_chunks_new(user_q: str, theme_hint: str|None, candidates_func):
+    """Новая функция ретрива с приоритетным поиском"""
+    # 1) точный H2
+    ch, flags = detect_section_early(user_q)
+    if ch: return [ch], flags
+
+    # 2) глобальный алиас из шапок → дефолт по теме
+    a = ALIAS_MAP_GLOBAL.get(norm_text(user_q))
+    if not a:
+        for k, v in ALIAS_MAP_GLOBAL.items():
+            if k in norm_text(user_q): a = v; break
+    if a:
+        ch, flags = get_default_chunk_for_topic(a["topic"])
+        if ch: return [ch], {"source":"alias","exact_h2_match":True,"topic":a["topic"]}
+
+    # 3) тема из роутера → дефолт темы
+    if theme_hint in CANON:
+        ch, flags = get_default_chunk_for_topic(theme_hint)
+        if ch: return [ch], flags
+
+    # 4) обычный поиск (ваша существующая функция выдаёт кандидатов)
+    cands = candidates_func(user_q)
+    return cands, {"source":"search","exact_h2_match":False}
+
 def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]:
     """Извлекает релевантные чанки с multi-query rewrite и улучшенным ранжированием"""
     if len(all_chunks) == 0:
@@ -916,6 +1091,24 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
     detected_topics = route_topics(query)
     print(f"🎯 Роутер определил темы: {detected_topics}")
     
+    # Прямой alias-fallback по карте frontmatter
+    q = _norm(query or "")
+    hit_map = ALIAS_MAP.get(q)
+    if not hit_map:
+        # допускаем "alias ⊆ query" (например, запрос длиннее)
+        for a, meta in ALIAS_MAP.items():
+            if a and a in q:
+                hit_map = meta
+                break
+
+    if hit_map:
+        # находим первый чанк соответствующего файла и возвращаем его
+        target = Path(hit_map["file"]).name
+        for ch in all_chunks:
+            if ch.file_name == target:
+                print(f"✅ Alias-fallback: {q} -> {hit_map['file']}")
+                return [ch]
+    
     # ==== БЫСТРЫЙ ПУТЬ: ДЕТЕКТ СУЩНОСТИ ====
     q = _norm(query or "")
     hit = None
@@ -924,7 +1117,11 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
     for alias, meta in ENTITY_INDEX.items():
         if alias in q:
             hit = ENTITY_CHUNKS.get((meta["topic"], meta["entity"]))
-            break
+            if not hit:
+                hit = next((ch for ch in all_chunks if ch.id == meta["entity"]), None) \
+                    or next((ch for ch in all_chunks if ch.file_name == meta["doc_id"]), None)
+            if hit:
+                break
     
     # Мягкий матч (разделители -/-/- и пробелы)
     if not hit:
@@ -933,7 +1130,11 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
             a2 = re.sub(r'[---]', '', alias)
             if a2 in q2:
                 hit = ENTITY_CHUNKS.get((meta["topic"], meta["entity"]))
-                break
+                if not hit:
+                    hit = next((ch for ch in all_chunks if ch.id == meta["entity"]), None) \
+                        or next((ch for ch in all_chunks if ch.file_name == meta["doc_id"]), None)
+                if hit:
+                    break
     
     if hit:
         print(f"✅ Найдена сущность каталога: '{query}' → {hit.id}")
@@ -1076,6 +1277,13 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, allow_cta: 
 }}
 """
     else:
+        # Адаптивная логика для verbatim: false файлов
+        format_instruction = ""
+        if "detailed" in preferred_format:
+            format_instruction = "\n\nВАЖНО: Дай развернутый, подробный ответ с максимальным количеством деталей и объяснений. Пользователь нуждается в полной информации."
+        elif "short" in preferred_format:
+            format_instruction = "\n\nВАЖНО: Дай краткий, лаконичный ответ по сути вопроса. Без лишних деталей."
+        
         system_prompt = f"""
 Ты — дружелюбный и внимательный ассистент стоматологической клиники ЦЭСИ на Камчатке.
 Твоя задача — отвечать на вопросы пациентов просто, понятно и с заботой, но строго по делу и на основе базы знаний.
@@ -1090,7 +1298,7 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, allow_cta: 
 5. Если вопрос тревожный — сначала факты из базы знаний, потом мягкая успокаивающая фраза.
 6. Формулировки и цифры из базы знаний сохраняй максимально точно, адаптируя под живой диалог.
 7. Если информации нет — честно скажи об этом и предложи альтернативу: консультацию или другой способ узнать ответ.
-8. В конце при возможности добавь мягкий CTA с предложением консультации.
+8. В конце при возможности добавь мягкий CTA с предложением консультации.{format_instruction}
 
 Как работать с базой:
 1. YAML-фронтматтер игнорируй при формулировании ответа, но используй его значения для стиля и структуры.
@@ -1267,6 +1475,11 @@ def render_markdown(synth: SynthJSON) -> str:
 # Основная функция
 def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, dict]:
     """Основная функция для получения ответа и метаданных"""
+    # ✅ Заводим переменные-флаги для bypass guard
+    alias_used = False
+    doctor_hit = False
+    exact_h2 = False
+    
     # Увеличиваем top_k для поиска врачей
     if DOCTOR_REGEX and DOCTOR_REGEX.search(user_message):
         top_k = 12
@@ -1277,10 +1490,77 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     # Извлекаем релевантные чанки
     relevant_chunks = retrieve_relevant_chunks(user_message, top_k=top_k)
     
+    # Если нет кандидатов, пробуем alias fallback
+    if not relevant_chunks:
+        from core.md_loader import alias_fallback
+        fallback_candidates = alias_fallback(user_message)
+        if fallback_candidates:
+            # ✅ Когда срабатывает alias-fallback — ставим alias_used = True
+            alias_used = True
+            print(f"✅ Alias fallback сработал: {len(fallback_candidates)} кандидатов")
+            
+            # Создаем фиктивные чанки для fallback
+            from dataclasses import dataclass
+            @dataclass
+            class FallbackChunk:
+                id: str
+                text: str
+                file_name: str
+                metadata: object
+                score: float = 1.0
+            
+            relevant_chunks = []
+            for candidate in fallback_candidates:
+                # Читаем файл и создаем чанк
+                try:
+                    with open(candidate["file"], 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    chunk = FallbackChunk(
+                        id=candidate["file"],
+                        text=content,
+                        file_name=candidate["file"].split('/')[-1],
+                        metadata=type('obj', (object,), {'h2_id': candidate["h2_id"]}),
+                        score=candidate["score"]
+                    )
+                    relevant_chunks.append(chunk)
+                except:
+                    continue
+    
     if not relevant_chunks:
         return """К сожалению, в моей базе нет информации по этому вопросу.
 
 Запишитесь на бесплатную консультацию — наш специалист ответит на все ваши вопросы.""", {}
+    
+    # Логируем кандидатов для отладки
+    print("🔍 CANDIDATES:")
+    for i, chunk in enumerate(relevant_chunks[:5]):
+        print(f"  {i+1}. {chunk.file_name}: {chunk.text[:100]}...")
+    
+    # Формируем candidates_with_scores для новой системы
+    candidates_with_scores = []
+    for chunk in relevant_chunks:
+        candidates_with_scores.append({
+            "chunk": chunk,
+            "score": getattr(chunk, 'score', 0.5),  # Базовый скор
+            "doc_id": chunk.id,
+            "file_name": chunk.file_name,
+            "topic": getattr(chunk.metadata, 'topic', None),
+            "h2_id": getattr(chunk.metadata, 'h2_id', None)
+        })
+    
+    # ✅ Определяем doctor_hit и exact_h2
+    if relevant_chunks:
+        primary_chunk = relevant_chunks[0]
+        # Проверяем, является ли это карточкой врача
+        if hasattr(primary_chunk.metadata, 'doc_type') and primary_chunk.metadata.doc_type in ('doctor', 'doctors'):
+            doctor_hit = True
+            print(f"✅ Doctor card hit: {primary_chunk.file_name}")
+        
+        # Проверяем точное совпадение H2 заголовка
+        if hasattr(primary_chunk.metadata, 'h2_id') and primary_chunk.metadata.h2_id:
+            # Можно добавить более сложную логику для exact_h2_match
+            exact_h2 = True
+            print(f"✅ Exact H2 match: {primary_chunk.metadata.h2_id}")
     
     # Сразу после получения relevant_chunks вычисляем флаги разрешений
     primary_chunk = relevant_chunks[0] if relevant_chunks else None
@@ -1399,6 +1679,23 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     # Добавляем used_chunks в метаданные
     used_ids = [ch.id for ch in relevant_chunks]
     rag_meta["used_chunks"] = used_ids
+    rag_meta["candidates_with_scores"] = candidates_with_scores
+    
+    # ✅ Добавляем флаги для bypass guard
+    rag_meta.update({
+        "used_chunks": [
+            {
+                "file": chunk.file_name,
+                "h2_id": getattr(chunk.metadata, "h2_id", None),
+                "score": getattr(chunk, "score", 0.0)
+            }
+            for chunk in relevant_chunks
+        ],
+        # флаги для bypass guard
+        "source": "alias" if alias_used else "search",
+        "doctor_card_hit": doctor_hit,
+        "exact_h2_match": exact_h2,
+    })
     
     # Добавляем поля эмпатии в метаданные
     rag_meta.update({

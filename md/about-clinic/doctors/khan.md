@@ -1,14 +1,17 @@
 ---
 title: "Хан Александр Олегович"
-aliases: ["хан александр олегович","хан главный врач","хан имплантолог","хан хирург","врач хан"]
-topic: "clinic"
-doc_type: "doctor"
-preferred_format: "short"
+doc_type: "doctors"
+topic: "doctors"
+verbatim: true
+aliases:
+  - "хан александр олегович"
+  - "хан главный врач"
+  - "хан имплантолог"
+  - "хан хирург"
+  - "врач хан"
+preferred_format: ["short","bullets"]
 cta_action: "consultation_doctor"
 cta_text: "Познакомиться с врачом на консультации"
-verbatim: true
-tone: "confident"
-emotion: "trust"
 updated: "2025-09-03"
 ---
 
