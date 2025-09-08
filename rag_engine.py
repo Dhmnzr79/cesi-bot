@@ -2,7 +2,7 @@
 import os
 import numpy as np
 from openai import OpenAI
-import faiss
+from core.faiss_compat import IndexFlatIP, normalize_L2_inplace, HAS_FAISS
 import yaml
 import re
 import json
@@ -845,10 +845,16 @@ try:
         embeddings = [get_embedding(text) for text in chunk_texts]
         
         dimension = len(embeddings[0])
-        index = faiss.IndexFlatL2(dimension)
-        index.add(np.array(embeddings).astype("float32"))
+        xb = np.asarray(embeddings, dtype="float32")
+        normalize_L2_inplace(xb)
+        index = IndexFlatIP(dimension)
+        index.add(xb)
         
         print(f"✅ Индекс создан с {len(ALL_CHUNKS)} чанками")
+        
+        # Логируем backend при старте
+        from core.logger import log_m
+        log_m.info(json.dumps({"event": "faiss_backend", "value": "faiss" if HAS_FAISS else "numpy"}, ensure_ascii=False))
 
 except Exception as e:
     print(f"❌ Критическая ошибка при инициализации: {e}")
@@ -949,7 +955,9 @@ def hybrid_retriever(query: str, top_n: int = 20) -> List[Tuple[RetrievedChunk, 
     # ==== Эмбеддинги поиск ====
     try:
         query_embedding = get_embedding(query)
-        D, I = index.search(np.array([query_embedding]).astype("float32"), k=min(top_n, len(all_chunks)))
+        q = np.asarray([query_embedding], dtype="float32")
+        normalize_L2_inplace(q)
+        D, I = index.search(q, min(top_n, len(all_chunks)))
         
         # Нормализуем embedding scores
         max_dist = max(D[0]) if len(D[0]) > 0 else 1.0
@@ -1616,6 +1624,10 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     logger = getLogger("cesi.rag")
     logger.info("➡️ Новый вопрос: %s", user_message)
     
+    # Логируем запрос в RAG
+    from core.logger import log_query
+    log_query(user_message, "rag_engine")
+    
     # Всегда инициализируем — чтобы не ловить UnboundLocalError
     detected_topics = []
     theme_hint = None
@@ -1863,6 +1875,12 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
             }
         }
 
+        # Логируем ответ в RAG
+        from core.logger import log_response, format_candidates_for_log
+        candidates = format_candidates_for_log(relevant_chunks[:3])  # Топ-3 кандидата
+        answer_text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
+        log_response(user_message, candidates, len(answer_text))
+        
         return payload, rag_meta
         
     except Exception:
