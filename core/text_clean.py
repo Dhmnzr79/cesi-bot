@@ -19,3 +19,4 @@ def clean_section_for_prompt(text: str) -> str:
     body = HTML_COMMENT_RE.sub("", body)
     body = re.sub(r"\n{3,}", "\n\n", body)
     return body.strip()
+

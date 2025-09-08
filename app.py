@@ -6,8 +6,8 @@ env_loaded = load_dotenv(find_dotenv(), override=True)
 if not env_loaded:  # fallback: .env рядом с app.py
     load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
-from core.logging_setup import setup_logging
-LOG_INFO = setup_logging(project_root=Path(__file__).resolve().parent)
+from core.logger import init_logging, self_test, LOG_DIR
+init_logging(console=True)
 
 import smtplib
 from email.mime.text import MIMEText
@@ -256,6 +256,31 @@ def is_cancellation(message):
     return None
 
 
+def format_contacts_answer(text: str) -> str:
+    """
+    Достаёт из сырого текста строки вида:
+    'Адрес:', 'Время работы:', 'Телефон:', 'WhatsApp:', 'Парковка:'.
+    Возвращает один компактный параграф без списков.
+    """
+    import re
+    t = text or ""
+    def grab(label):
+        m = re.search(rf"{label}\s*:\s*(.+?)(?:[.;]|$)", t, flags=re.I)
+        return (m.group(1).strip() if m else "")
+    addr = grab("Адрес")
+    time = grab("Время работы")
+    tel  = grab("Телефон")
+    wa   = grab("WhatsApp")
+    park = grab("Парковка")
+    parts = []
+    if addr: parts.append(f"Адрес: {addr}")
+    if time: parts.append(f"Время работы: {time}")
+    if tel:  parts.append(f"Телефон: {tel}")
+    if wa:   parts.append(f"WhatsApp: {wa}")
+    if park: parts.append(f"Парковка: {park}")
+    return "Адрес и контакты — " + "; ".join(parts) + "."
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
@@ -378,7 +403,6 @@ def chat():
         from core.rag_integration import enhance_rag_retrieval
         from core.router import theme_router
         from core.normalize import normalize_ru
-        from core.logger import log_bot_response, format_candidates_for_log
         
         # 1. Нормализация запроса
         normalized_query = normalize_ru(message)
@@ -499,9 +523,7 @@ def chat():
             )
             final_text = _clean_text(final_text)
             
-            # Ограничиваем длину ответа
-            if len(final_text) > MAX_FINAL_CHARS:
-                final_text = final_text[:MAX_FINAL_CHARS].rsplit('\n', 1)[0] + "..."
+            # Ограничиваем длину ответа - убрано, управляется через finalize_answer()
             
             # Собираем чистый ответ
             resp = {
@@ -520,8 +542,8 @@ def chat():
                 if "show" not in cta: cta = {"show": False, "variant":"consult"}
                 fu = d.get("followups") or d.get("suggestions") or []
                 return {
-                    "answer": (ans or "")[:700].strip(),
-                    "empathy": (emp or "")[:250].strip(),
+                    "answer": (ans or "").strip(),
+                    "empathy": (emp or "").strip(),
                     "cta": cta,
                     "followups": fu
                 }
@@ -529,25 +551,56 @@ def chat():
             # Применяем нормализацию
             out = coerce_output(resp)
             
-            # Умная обрезка и санитизация
+            # Умная обрезка и санитизация с лимитами по темам
             from core.text_utils import finalize_answer, finalize_empathy
-            ans, cut_a = finalize_answer(out.get("answer",""), limit=700)
-            emp, cut_e = finalize_empathy(out.get("empathy",""), limit=220)
+            from core.answer_style import decide_style
+            
+            theme = (rag_meta.get("theme_hint") or "").lower()
+            style = decide_style(theme)
+            
+            # Специальная обработка для контактов
+            if theme == "contacts":
+                raw_answer = out.get("answer","")
+                formatted_answer = format_contacts_answer(raw_answer)
+                ans, cut_a = finalize_answer(
+                    formatted_answer,
+                    limit=style.max_chars,
+                    allow_ellipsis=style.allow_ellipsis,
+                    allow_bullets=False,  # контакты всегда параграф
+                    max_bullets=0,
+                )
+            else:
+                ans, cut_a = finalize_answer(
+                    out.get("answer",""),
+                    limit=style.max_chars,
+                    allow_ellipsis=style.allow_ellipsis,
+                    allow_bullets=(style.mode=="list"),
+                    max_bullets=style.max_bullets,
+                )
+            emp, cut_e = finalize_empathy(out.get("empathy",""), limit=200)
             out["answer"], out["empathy"] = ans, emp
             
-            # лог для контроля
-            logger.info({"ev": "return", "final_text_len": len(final_text), "keys": list(resp.keys())})
-            if not final_text:
+            # если резали список — предложим раскрыть:
+            if cut_a and style.mode=="list":
+                fu = out.get("followups") or []
+                if not any("полный" in (x.get("label","")+x.get("query","")).lower() for x in fu):
+                    fu.append({"label":"Показать полный список","query":"покажите полный список по теме"})
+                out["followups"] = fu
+            
+            # Проверяем что ответ не пустой
+            if not out.get("answer"):
                 # если вдруг где-то по дороге обнулили - честный каркас вместо фолбэка фронта
                 from core.answer_builder import LOW_REL_JSON
                 return jsonify(LOW_REL_JSON), 200
             
-            # Старые логи удалены - используется только final_answer
-            
             # Логируем финальный ответ
-            import json, logging
+            import logging, json
             log_m = logging.getLogger("cesi.minimal_logs")
-            log_m.info(json.dumps({"ev":"final_answer","len":len(out["answer"]), "truncated":bool(cut_a), "cta":bool(out["cta"].get("show"))}, ensure_ascii=False))
+            log_m.info(json.dumps({"ev":"final_answer","len": len(out.get("answer","")), "cta": bool(out.get("cta",{}).get("show")), "truncated": bool(cut_a)}, ensure_ascii=False))
+            
+            # Логируем ответ бота
+            log_resp = logging.getLogger("cesi.bot_responses")
+            log_resp.info(json.dumps({"ev":"bot_response","q": message, "answer": out.get("answer",""), "empathy": out.get("empathy",""), "cta": out.get("cta",{}), "followups": out.get("followups",[])}, ensure_ascii=False))
             
             # Возвращаем нормализованный ответ
             return jsonify(out), 200
@@ -566,9 +619,8 @@ def chat():
                 session["last_cta_ts"] = now
             
             # Логируем запрос для анализа (после троттлинга CTA)
-            try:
-                # Старые логи удалены - используется только final_answer
-                cta_final = cta if cta and not throttled else None
+            # Старые логи удалены - используется только final_answer
+            cta_final = cta if cta and not throttled else None
             
             session_messages[session_id].append({"role": "user", "content": message})
             session_messages[session_id].append({"role": "assistant", "content": adapted_response})
@@ -594,16 +646,50 @@ def chat():
             # Нормализуем Legacy ответ к строгому JSON-контракту
             out_legacy = coerce_output(payload)
             
-            # Умная обрезка и санитизация
+            # Умная обрезка и санитизация с лимитами по темам
             from core.text_utils import finalize_answer, finalize_empathy
-            ans_legacy, cut_a_legacy = finalize_answer(out_legacy.get("answer",""), limit=700)
-            emp_legacy, cut_e_legacy = finalize_empathy(out_legacy.get("empathy",""), limit=220)
+            from core.answer_style import decide_style
+            
+            theme_legacy = (rag_meta.get("theme_hint") or "").lower()
+            style_legacy = decide_style(theme_legacy)
+            
+            # Специальная обработка для контактов
+            if theme_legacy == "contacts":
+                raw_answer_legacy = out_legacy.get("answer","")
+                formatted_answer_legacy = format_contacts_answer(raw_answer_legacy)
+                ans_legacy, cut_a_legacy = finalize_answer(
+                    formatted_answer_legacy,
+                    limit=style_legacy.max_chars,
+                    allow_ellipsis=style_legacy.allow_ellipsis,
+                    allow_bullets=False,  # контакты всегда параграф
+                    max_bullets=0,
+                )
+            else:
+                ans_legacy, cut_a_legacy = finalize_answer(
+                    out_legacy.get("answer",""),
+                    limit=style_legacy.max_chars,
+                    allow_ellipsis=style_legacy.allow_ellipsis,
+                    allow_bullets=(style_legacy.mode=="list"),
+                    max_bullets=style_legacy.max_bullets,
+                )
+            emp_legacy, cut_e_legacy = finalize_empathy(out_legacy.get("empathy",""), limit=200)
             out_legacy["answer"], out_legacy["empathy"] = ans_legacy, emp_legacy
             
+            # если резали список — предложим раскрыть:
+            if cut_a_legacy and style_legacy.mode=="list":
+                fu_legacy = out_legacy.get("followups") or []
+                if not any("полный" in (x.get("label","")+x.get("query","")).lower() for x in fu_legacy):
+                    fu_legacy.append({"label":"Показать полный список","query":"покажите полный список по теме"})
+                out_legacy["followups"] = fu_legacy
+            
             # Логируем финальный ответ
-            import json, logging
+            import logging, json
             log_m = logging.getLogger("cesi.minimal_logs")
-            log_m.info(json.dumps({"ev":"final_answer","len":len(out_legacy["answer"]), "truncated":bool(cut_a_legacy), "cta":bool(out_legacy["cta"].get("show"))}, ensure_ascii=False))
+            log_m.info(json.dumps({"ev":"final_answer","len": len(out_legacy.get("answer","")), "cta": bool(out_legacy.get("cta",{}).get("show")), "truncated": bool(cut_a_legacy)}, ensure_ascii=False))
+            
+            # Логируем ответ бота
+            log_resp = logging.getLogger("cesi.bot_responses")
+            log_resp.info(json.dumps({"ev":"bot_response","q": message, "answer": out_legacy.get("answer",""), "empathy": out_legacy.get("empathy",""), "cta": out_legacy.get("cta",{}), "followups": out_legacy.get("followups",[])}, ensure_ascii=False))
             
             return jsonify(out_legacy), 200
             
@@ -625,6 +711,11 @@ def chat():
 @app.route('/health', methods=['GET'])
 def health():
     return "ok", 200
+
+@app.route('/admin/log-self-test', methods=['GET'])
+def log_self_test():
+    ok = self_test()
+    return {"ok": ok, "log_dir": str(LOG_DIR)}
 
 
 @app.route('/submit-lead', methods=['POST'])

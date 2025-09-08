@@ -9,3 +9,4 @@ def is_index_like(path: Path, text: str) -> bool:
     if text.count("<!-- aliases:") >= 2:
         return True
     return len(text.strip()) < 400
+

@@ -35,3 +35,4 @@ def normalize_L2_inplace(x: np.ndarray):
         _faiss.normalize_L2(x)
     else:
         x[:] = _normalize(x)
+
