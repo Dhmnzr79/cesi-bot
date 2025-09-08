@@ -214,7 +214,7 @@ def register_file(file_name: str, md_text: str):
 DEFAULT_H2 = {
   "consultation": ("consultation-free.md",         "обзор"),
   "prices":       ("prices-clinic.md",             None),
-  "warranty":     ("about-clinic/warranty.md",     "обзор"),
+  "warranty":     ("warranty.md",                  "обзор"),
   "contacts":     ("clinic-contacts.md",           None),
   "implants":     ("implants-overview.md",         "обзор"),
   "safety":       ("implants-contraindications.md","обзор"),
@@ -307,8 +307,8 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
                     "h2_aliases": h2_aliases
                 })
                 
-                # Включаем алиасы в индексируемый текст
-                index_text = f"{h2_title} " + " ".join(h2_aliases) + "\n" + preamble_text
+                # Алиасы только для поиска, не в тексте ответа
+                index_text = preamble_text
                 chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
             
             # дальше создать чанки для каждого ### как сейчас
@@ -331,8 +331,8 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
                     "h2_aliases": h2_aliases
                 })
                 
-                # Включаем алиасы в индексируемый текст
-                index_text = f"{h2_title} " + " ".join(h2_aliases) + "\n" + text
+                # Алиасы только для поиска, не в тексте ответа
+                index_text = text
                 chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
         else:
             # Н3 нет - сохраняем Н2 как единый чанк
@@ -346,8 +346,8 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
                 "h2_aliases": h2_aliases
             })
             
-            # Включаем алиасы в индексируемый текст
-            index_text = f"{h2_title} " + " ".join(h2_aliases) + "\n" + text
+            # Алиасы только для поиска, не в тексте ответа
+            index_text = text
             chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
     
     return chunks
@@ -800,8 +800,9 @@ try:
         print(f"🔍 Создаем BM25 индекс для {len(ALL_CHUNKS)} чанков...")
         bm25_corpus = []
         for chunk in ALL_CHUNKS:
-            # Токенизируем текст для BM25
-            tokens = re.findall(r'\w+', chunk.text.lower())
+            # Токенизируем текст + алиасы для BM25
+            alias_boost = " ".join(getattr(chunk.metadata, 'h2_aliases', ()) or [])
+            tokens = re.findall(r'\w+', (chunk.text + " " + alias_boost).lower())
             bm25_corpus.append(tokens)
         
         bm25_index = BM25Okapi(bm25_corpus)
@@ -836,8 +837,11 @@ try:
         # Делаем функцию глобально доступной
         globals()['get_embedding'] = get_embedding
         
-        # Создаем эмбеддинги только для текста чанков
-        chunk_texts = [chunk.text for chunk in ALL_CHUNKS]
+        # Создаем эмбеддинги: текст + алиасы для поиска
+        chunk_texts = []
+        for chunk in ALL_CHUNKS:
+            alias_boost = " ".join(getattr(chunk.metadata, 'h2_aliases', ()) or [])
+            chunk_texts.append((chunk.text + " " + alias_boost).strip())
         embeddings = [get_embedding(text) for text in chunk_texts]
         
         dimension = len(embeddings[0])
@@ -1095,37 +1099,96 @@ def detect_section_early(user_q: str):
 
 # === 7) Главная функция ретрива ===
 def retrieve_relevant_chunks_new(user_q: str, theme_hint: str|None, candidates_func):
-    """Новая функция ретрива с приоритетным поиском"""
+    """Новая функция ретрива: подсказки (H2/тема) добавляются к кандидатам, а не прерывают поиск."""
     print(f"🔍 NEW ENGINE: query='{user_q}', theme_hint='{theme_hint}'")
-    
-    # 1) точный H2
-    ch, flags = detect_section_early(user_q)
-    if ch: 
-        print(f"✅ H2 match found: {ch.id}")
-        return [ch], flags
 
-    # 2) глобальный алиас из шапок → дефолт по теме (ОТКЛЮЧЕН)
-    # a = ALIAS_MAP_GLOBAL.get(norm_text(user_q))
-    # if not a:
-    #     for k, v in ALIAS_MAP_GLOBAL.items():
-    #         if k in norm_text(user_q): a = v; break
-    # if a:
-    #     ch, flags = get_default_chunk_for_topic(a["topic"])
-    #     if ch: 
-    #         print(f"✅ Alias match found: {a['topic']} -> {ch.id}")
-    #         return [ch], {"source":"alias","exact_h2_match":True,"topic":a["topic"]}
-
-    # 3) тема из роутера → дефолт темы
-    if theme_hint in CANON:
-        ch, flags = get_default_chunk_for_topic(theme_hint)
-        if ch: 
-            print(f"✅ Theme match found: {theme_hint} -> {ch.id}")
+    # Если явно разрешён старый fastpath — оставим прежнее поведение
+    if os.getenv("DISABLE_ALIAS_FASTPATH", "true").lower() != "true":
+        ch, flags = detect_section_early(user_q)
+        if ch:
+            print(f"✅ H2 match found (fastpath): {ch.id}")
             return [ch], flags
+        if theme_hint in CANON:
+            ch, flags = get_default_chunk_for_topic(theme_hint)
+            if ch:
+                print(f"✅ Theme match found (fastpath): {theme_hint} -> {ch.id}")
+                return [ch], flags
 
-    # 4) обычный поиск (ваша существующая функция выдаёт кандидатов)
-    cands = candidates_func(user_q)
-    print(f"🔍 Search candidates: {len(cands)} found")
-    return cands, {"source":"search","exact_h2_match":False}
+    mixed: list[RetrievedChunk] = []
+
+    # 1) точный H2 — добавляем к кандидатам
+    ch, _flags = detect_section_early(user_q)
+    if ch:
+        print(f"✅ H2 hint: {ch.id}")
+        mixed.append(ch)
+
+    # 2) дефолт по теме — тоже добавляем
+    if theme_hint in CANON:
+        ch2, _flags2 = get_default_chunk_for_topic(theme_hint)
+        if ch2:
+            print(f"✅ Theme hint: {theme_hint} -> {ch2.id}")
+            mixed.append(ch2)
+
+    # 3) обычный поиск
+    search_cands = candidates_func(user_q) or []
+    print(f"🔍 Search candidates: {len(search_cands)} found")
+    mixed.extend(search_cands)
+
+    # 4) дедуп по chunk.id или file_name
+    seen = set()
+    out = []
+    for c in mixed:
+        cid = getattr(c, "id", None) or getattr(getattr(c, "meta", {}), "get", lambda k=None: None)("id")
+        fid = getattr(c, "file_name", None)
+        key = cid or fid
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+
+    # 5) Реранкер: дать базовый score и реально пересортировать
+    def _ensure_scores(cands):
+        """Убеждаемся, что у каждого кандидата есть базовый score"""
+        for i, c in enumerate(cands):
+            score = getattr(c, "score", None) or getattr(c, "cosine", None) or getattr(c, "bm25", None)
+            if score is None:
+                score = 0.5  # базовый score
+            c.score = float(score) - i * 1e-6  # стабильность порядка
+    
+    def _bonus_for_query(c, q: str, theme: str) -> float:
+        """Бонус за релевантность к запросу и теме"""
+        t = (getattr(c, "text", "") or "").lower()
+        q = (q or "").lower()
+        b = 0.0
+        
+        # прижив/оссео
+        if "прижив" in q or "оссео" in q:
+            if any(x in t for x in ["прижив", "оссеоинтегр"]): b += 0.10
+        
+        # боязнь/боль
+        if any(x in q for x in ["боюсь", "боль", "анестез", "обезбол"]):
+            if any(x in t for x in ["без боли", "анестез", "обезбол"]): b += 0.10
+        
+        # контакты
+        if theme == "contacts":
+            if any(x in t for x in ["адрес", "телефон", "график", "как добраться"]): b += 0.10
+        
+        # гарантия
+        if theme == "warranty":
+            if "гаранти" in t: b += 0.08
+        
+        # цены
+        if theme == "prices":
+            if any(x in t for x in ["цена", "стоимость", "сколько стоит", "рассрочка"]): b += 0.08
+        
+        return b
+    
+    _ensure_scores(out)
+    for c in out:
+        c.score += _bonus_for_query(c, user_q, theme_hint or "")
+    out.sort(key=lambda x: x.score, reverse=True)
+
+    return out, {"source": "mix", "exact_h2_match": False}
 
 def retrieve_relevant_chunks(query: str, top_k: int = None) -> List[RetrievedChunk]:
     if top_k is None:
@@ -1272,7 +1335,33 @@ def retrieve_relevant_chunks(query: str, top_k: int = None) -> List[RetrievedChu
         print(f"❌ Ошибка при поиске чанков: {e}")
         return []
 
-def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, allow_cta: bool) -> SynthJSON:
+def _strip_md(s: str) -> str:
+    """Очистка от Markdown разметки"""
+    if not s:
+        return ""
+    s = re.sub(r'<!--.*?-->', '', s, flags=re.DOTALL)
+    s = re.sub(r'(?im)^\s*aliases\s*:\s*\[.*?\]\s*$', '', s)
+    s = re.sub(r'(?m)^\s*#{1,6}\s*', '', s)
+    s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
+    s = re.sub(r'__(.+?)__', r'\1', s)
+    s = re.sub(r'(?<!\w)_(.*?)_(?!\w)', r'\1', s)
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+
+def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, verbatim=False) -> dict:
+    """Мини-синтез без LLM: склеиваем 2-3 самых релевантных фрагмента, очищаем Markdown."""
+    texts = []
+    for ch in (chunks or [])[:3]:
+        t = _strip_md(getattr(ch, "text", ""))
+        if t:
+            texts.append(t[:400])  # первые 400 символов
+    
+    if verbatim or not texts:
+        return {"text": texts[0] if texts else ""}
+    
+    return {"text": "\n\n".join(texts)}
+
+def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_cta: bool) -> SynthJSON:
     """Синтезирует структурированный JSON ответ"""
     
     # Определяем метаданные для ответа (берем из первого чанка)
@@ -1660,9 +1749,9 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
             # честный низкий релеванс
             return LOW_REL_JSON.copy(), rag_meta
 
-        # --- 4) Сборка текста (твоя логика извлечения лучшего чанка)
-        best_chunk = relevant_chunks[0]
-        answer_text = best_chunk.text  # или как у тебя
+        # --- 4) Синтез ответа из нескольких чанков
+        synth = synthesize_answer(relevant_chunks, user_message)
+        answer_text = synth.get("text", "")
 
         # --- 4.5) Guard-fallback для «боль/страх»
         cand_cnt = len(relevant_chunks)
@@ -1701,7 +1790,8 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
             score = max(score, 0.9)  # если это был форс-алиас (если у вас есть такой флаг)
 
         # --- 5) Постпроцесс: эмпатия/бридж + CTA
-        topic_meta = getattr(best_chunk.metadata, '__dict__', {}) or {}
+        best_chunk = relevant_chunks[0] if relevant_chunks else None
+        topic_meta = getattr(best_chunk.metadata, '__dict__', {}) or {} if best_chunk else {}
         intent = theme_hint  # или твой интент-детектор
         payload = postprocess(
             answer_text=answer_text,

@@ -43,6 +43,9 @@ from datetime import datetime, timezone, timedelta, time
 
 load_dotenv()  # Читает .env из корня проекта
 
+# Глобальные константы
+MAX_FINAL_CHARS = int(os.getenv("MAX_FINAL_CHARS", "800"))
+
 # Отладка ENV переменных
 print("DEBUG RESPONSE_MODE =", os.getenv("RESPONSE_MODE"))
 print("DEBUG ENABLE_EMPATHY =", os.getenv("ENABLE_EMPATHY"))
@@ -459,6 +462,11 @@ def chat():
                 s = re.sub(r'(?im)^\s*aliases\s*:\s*\[.*?\]\s*$', '', s)
                 # 2) убрать ### и ## в начале строк
                 s = re.sub(r'(?m)^\s*#{2,3}\s*', '', s)
+                # 2.1) снять жир/курсив (**...** / __...__)
+                s = re.sub(r'(\*\*|_)(.*?)\1', r'\2', s)
+                s = re.sub(r'(?<!\w)_(.*?)_(?!\w)', r'\1', s)
+                # 2.2) нормализовать маркеры списков (•, *) в '- '
+                s = re.sub(r'(?m)^\s*[•*]\s+', '- ', s)
                 # 3) схлопнуть лишние пустые строки
                 s = re.sub(r'\n{3,}', '\n\n', s)
                 # 4) убрать дубликаты первой строки
@@ -488,6 +496,10 @@ def chat():
                 or ""
             )
             final_text = _clean_text(final_text)
+            
+            # Ограничиваем длину ответа
+            if len(final_text) > MAX_FINAL_CHARS:
+                final_text = final_text[:MAX_FINAL_CHARS].rsplit('\n', 1)[0] + "..."
             
             # Собираем чистый ответ
             resp = {
