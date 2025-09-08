@@ -1377,16 +1377,32 @@ def _strip_md(s: str) -> str:
 
 def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, verbatim=False) -> dict:
     """Мини-синтез без LLM: склеиваем 2-3 самых релевантных фрагмента, очищаем Markdown."""
-    texts = []
-    for ch in (chunks or [])[:3]:
-        t = _strip_md(getattr(ch, "text", ""))
-        if t:
-            texts.append(t[:400])  # первые 400 символов
     
-    if verbatim or not texts:
-        return {"text": texts[0] if texts else ""}
+    # Подготовка контекста с очисткой и shaping
+    from core.text_clean import clean_section_for_prompt
+    from core.answer_shaping import should_verbatim, clamp_bullets, slice_for_prompt
+    import json, logging
+    log_m = logging.getLogger("cesi.minimal_logs")
     
-    return {"text": "\n\n".join(texts)}
+    prepared_chunks, prepared_len, verbatim_used = [], 0, False
+    for sec in chunks[:3]:  # берем только первые 3 чанка
+        meta = getattr(sec, "meta", {}) or {}
+        clean = clean_section_for_prompt(sec.text)
+        if should_verbatim(meta):
+            prepared = clamp_bullets(clean, max_bullets=6)
+            verbatim_used = True
+        else:
+            prepared = slice_for_prompt(clean, limit_chars=900)
+        prepared_chunks.append(prepared)
+        prepared_len += len(prepared)
+    
+    log_m.info(json.dumps({"ev":"prepared_context","count":len(prepared_chunks),"prepared_len":prepared_len,"verbatim":verbatim_used}, ensure_ascii=False))
+    
+    # Используем подготовленные чанки вместо сырых текстов
+    if verbatim or not prepared_chunks:
+        return {"text": prepared_chunks[0] if prepared_chunks else ""}
+    
+    return {"text": "\n\n".join(prepared_chunks)}
 
 def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_cta: bool) -> SynthJSON:
     """Синтезирует структурированный JSON ответ"""
@@ -1528,7 +1544,11 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
 Запрещено:
 - оглавления, перечисление тем, H2/H3;
 - поля фронтматтера (title, aliases, mini_links, verbatim) и HTML-комментарии;
-- длинные копипасты из базы.
+- длинные копипасты из базы;
+- символы '#', '*', '•' и заголовки вида "### ..." в тексте.
+
+Пиши 3–6 коротких фраз, разделённых —. Заверши ответ точкой.
+Не используй #, *, • и заголовки. Максимум ~600–700 символов.
 
 Схема:
 {
@@ -1543,7 +1563,7 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
     completion = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,  # низкая температура для стабильности
-        max_tokens=250,   # ограничиваем длину
+        max_tokens=220,   # ограничиваем длину
         top_p=0.8,       # ограничиваем выбор токенов
         response_format={"type": "json_object"},
         messages=[
@@ -1553,6 +1573,11 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
     )
     
     try:
+        # Логируем финиш модели
+        finish = completion.choices[0].finish_reason  # "stop" | "length" | ...
+        c_tokens = getattr(completion.usage, "completion_tokens", None)
+        log_m.info(json.dumps({"ev":"llm_finish","finish":finish,"completion_tokens":c_tokens,"max_tokens":220}, ensure_ascii=False))
+        
         json_response = json.loads(completion.choices[0].message.content)
         
         # Валидация и обрезка ответа
@@ -1952,8 +1977,8 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
 
         # Логируем ответ в RAG
         from core.logger import format_candidates_for_log
-        import logging
-        log_m = logging.getLogger("cesi.minimal_logs")
+        from logging import getLogger
+        log_m = getLogger("cesi.minimal_logs")
         try:
             log_m.info(json.dumps({
                 "ev":"search_candidates",
@@ -1981,7 +2006,6 @@ def log_query_response(user_message: str, response: str, metadata: dict, chunks_
         "answer": response,
         "metadata": metadata,
         "chunks_used": chunks_used or [],
-        "answer_length": len(response),
         "has_cta": bool(metadata.get("cta_action")),
         "topic": metadata.get("topic", "unknown"),
         "doc_type": metadata.get("doc_type", "unknown"),

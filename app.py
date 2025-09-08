@@ -511,6 +511,30 @@ def chat():
                 "followups": adapted_meta.get("followups") or [],
             }
             
+            # Нормализуем ответ к строгому JSON-контракту
+            def coerce_output(d: dict) -> dict:
+                ans = d.get("answer") or d.get("text") or d.get("response") or ""
+                emp = d.get("empathy") or d.get("opener") or d.get("opening") or ""
+                cta = d.get("cta") or {}
+                if isinstance(cta, bool): cta = {"show": bool(cta), "variant":"consult"}
+                if "show" not in cta: cta = {"show": False, "variant":"consult"}
+                fu = d.get("followups") or d.get("suggestions") or []
+                return {
+                    "answer": (ans or "")[:700].strip(),
+                    "empathy": (emp or "")[:250].strip(),
+                    "cta": cta,
+                    "followups": fu
+                }
+            
+            # Применяем нормализацию
+            out = coerce_output(resp)
+            
+            # Умная обрезка и санитизация
+            from core.text_utils import finalize_answer, finalize_empathy
+            ans, cut_a = finalize_answer(out.get("answer",""), limit=700)
+            emp, cut_e = finalize_empathy(out.get("empathy",""), limit=220)
+            out["answer"], out["empathy"] = ans, emp
+            
             # лог для контроля
             logger.info({"ev": "return", "final_text_len": len(final_text), "keys": list(resp.keys())})
             if not final_text:
@@ -518,50 +542,15 @@ def chat():
                 from core.answer_builder import LOW_REL_JSON
                 return jsonify(LOW_REL_JSON), 200
             
-            # Логируем ответ
-            try:
-                from core.logger import log_response, log_minimal, format_candidates_for_log
-                
-                # Форматируем кандидатов для лога
-                candidates = []
-                if rag_meta.get("candidates_with_scores"):
-                    raw_candidates = []
-                    for item in rag_meta["candidates_with_scores"]:
-                        if isinstance(item, dict) and "chunk" in item:
-                            raw_candidates.append((item["chunk"], item.get("score", 0.0)))
-                    candidates = format_candidates_for_log(raw_candidates)
-                
-                log_response(message, candidates, len(final_text))
-                
-                # Минимальный лог
-                best_score = 0.0
-                if rag_meta.get("candidates_with_scores"):
-                    first_candidate = rag_meta["candidates_with_scores"][0]
-                    if isinstance(first_candidate, dict):
-                        best_score = first_candidate.get("score", 0.0)
-                
-                log_minimal(message, best_score, feature_flags.get("GUARD_THRESHOLD", 0.35), bool(resp.get("cta")), resp.get("guard_used", False))
-                
-                # Структурное логирование для JSON-ветки
-                from core.logger import log_bot_response, format_candidates_for_log
-                log_bot_response(
-                    user_query=message,
-                    response_data=resp,
-                    theme_hint=theme_hint,
-                    candidates=format_candidates_for_log(resp.get("candidates", [])),
-                    scores={},
-                    relevance_score=resp.get("relevance_score"),
-                    guard_threshold=feature_flags.get("GUARD_THRESHOLD", 0.35),
-                    low_relevance=resp.get("guard_used", False),
-                    shown_cta=bool(resp.get("cta")),
-                    followups_count=len(resp.get("followups", [])),
-                    opener_used=resp.get("opener_used", False),
-                    closer_used=resp.get("closer_used", False),
-                )
-            except Exception as e:
-                print(f"⚠️ Ошибка логирования(JSON): {e}")
+            # Старые логи удалены - используется только final_answer
             
-            return jsonify(resp), 200
+            # Логируем финальный ответ
+            import json, logging
+            log_m = logging.getLogger("cesi.minimal_logs")
+            log_m.info(json.dumps({"ev":"final_answer","len":len(out["answer"]), "truncated":bool(cut_a), "cta":bool(out["cta"].get("show"))}, ensure_ascii=False))
+            
+            # Возвращаем нормализованный ответ
+            return jsonify(out), 200
         else:
             # Legacy формат
             # Строим CTA для совместимости
@@ -578,52 +567,8 @@ def chat():
             
             # Логируем запрос для анализа (после троттлинга CTA)
             try:
-                # Логируем ответ в legacy режиме
-                from core.logger import log_response, log_minimal, format_candidates_for_log
+                # Старые логи удалены - используется только final_answer
                 cta_final = cta if cta and not throttled else None
-                
-                # Форматируем кандидатов для лога
-                candidates = []
-                if rag_meta.get("candidates_with_scores"):
-                    raw_candidates = []
-                    for item in rag_meta["candidates_with_scores"]:
-                        if isinstance(item, dict) and "chunk" in item:
-                            raw_candidates.append((item["chunk"], item.get("score", 0.0)))
-                    candidates = format_candidates_for_log(raw_candidates)
-                
-                log_response(message, candidates, len(adapted_response))
-                
-                # Минимальный лог
-                best_score = 0.0
-                if rag_meta.get("candidates_with_scores"):
-                    first_candidate = rag_meta["candidates_with_scores"][0]
-                    if isinstance(first_candidate, dict):
-                        best_score = first_candidate.get("score", 0.0)
-                
-                log_minimal(message, best_score, feature_flags.get("GUARD_THRESHOLD", 0.35), bool(cta_final), adapted_meta.get("guard_used", False))
-                
-                # Старое логирование (для совместимости)
-                from rag_engine import log_query_response
-                used_chunks = rag_meta.get("used_chunks", [])
-                log_query_response(message, adapted_response, {**rag_meta, "shown_cta": bool(cta_final)}, used_chunks)
-                
-                # Новое структурированное логирование
-                log_bot_response(
-                    user_query=message,
-                    response_data=log_response_data,
-                    theme_hint=theme_hint,
-                    candidates=format_candidates_for_log(adapted_meta.get("candidates", [])),
-                    scores={},
-                    relevance_score=adapted_meta.get("relevance_score"),
-                    guard_threshold=feature_flags.get("GUARD_THRESHOLD", 0.35),
-                    low_relevance=adapted_meta.get("guard_used", False),
-                    shown_cta=bool(cta_final),
-                    followups_count=len(adapted_meta.get("followups", [])),
-                    opener_used=rag_meta.get("opener_used", False),
-                    closer_used=rag_meta.get("closer_used", False)
-                )
-            except Exception as e:
-                print(f"⚠️ Ошибка логирования: {e}")
             
             session_messages[session_id].append({"role": "user", "content": message})
             session_messages[session_id].append({"role": "assistant", "content": adapted_response})
@@ -646,7 +591,21 @@ def chat():
             if cta_final:
                 payload["cta"] = cta_final
             
-            return jsonify(payload), 200
+            # Нормализуем Legacy ответ к строгому JSON-контракту
+            out_legacy = coerce_output(payload)
+            
+            # Умная обрезка и санитизация
+            from core.text_utils import finalize_answer, finalize_empathy
+            ans_legacy, cut_a_legacy = finalize_answer(out_legacy.get("answer",""), limit=700)
+            emp_legacy, cut_e_legacy = finalize_empathy(out_legacy.get("empathy",""), limit=220)
+            out_legacy["answer"], out_legacy["empathy"] = ans_legacy, emp_legacy
+            
+            # Логируем финальный ответ
+            import json, logging
+            log_m = logging.getLogger("cesi.minimal_logs")
+            log_m.info(json.dumps({"ev":"final_answer","len":len(out_legacy["answer"]), "truncated":bool(cut_a_legacy), "cta":bool(out_legacy["cta"].get("show"))}, ensure_ascii=False))
+            
+            return jsonify(out_legacy), 200
             
     except Exception as e:
         print(f"Ошибка обработки сообщения: {e}")
