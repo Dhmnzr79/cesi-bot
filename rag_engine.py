@@ -656,10 +656,26 @@ try:
     else:
         print(f"ERROR: Файл config/themes.json НЕ найден!")
     
-    for file in folder_path.rglob("*.md"):
+    # Подключаем фильтр для служебных MD файлов
+    from core.md_filter import is_index_like
+    import json, logging
+    log_m = logging.getLogger("cesi.minimal_logs")
+    
+    all_md_files = list(folder_path.rglob("*.md"))
+    skipped = 0
+    docs = []
+    
+    for file in all_md_files:
         try:
             print(f"📄 Обрабатываю файл: {file}")
             text = file.read_text(encoding="utf-8")
+            
+            # Фильтруем служебные файлы
+            if is_index_like(file, text):
+                skipped += 1
+                print(f"  ⏭️ Пропускаем служебный файл: {file.name}")
+                continue
+            
             print(f"  📖 Прочитан файл: {file.name} ({len(text)} символов)")
             
             # Регистрируем файл в новых индексах
@@ -782,6 +798,9 @@ try:
             import traceback
             traceback.print_exc()
             continue
+    
+    # Логируем статистику фильтрации
+    log_m.info(json.dumps({"ev":"filter_index_like","skipped":skipped,"total":len(all_md_files)}, ensure_ascii=False))
     
     print(f"\u23f3 Найдено {len(all_chunks)} чанков")
     
@@ -1877,6 +1896,7 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
 
         # Логируем ответ в RAG
         from core.logger import format_candidates_for_log
+        import logging
         log_m = logging.getLogger("cesi.minimal_logs")
         try:
             log_m.info(json.dumps({
