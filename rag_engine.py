@@ -1425,11 +1425,26 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
         }
     
     # Формируем контекст из чанков для LLM
+    from core.text_clean import clean_section_for_prompt
+    import json, logging
+    log_m = logging.getLogger("cesi.minimal_logs")
+    
     context_parts = []
+    total_before, total_after = 0, 0
+    cleaned = []
+    
     for chunk in chunks:
-        context_parts.append(f"ID: {chunk.id}\nОбновлено: {chunk.updated}\nКритичность: {chunk.criticality}\nКонтент:\n{chunk.text}\n")
+        t = chunk.text
+        total_before += len(t)
+        c = clean_section_for_prompt(t)
+        total_after += len(c)
+        cleaned.append(c)
+        context_parts.append(f"ID: {chunk.id}\nОбновлено: {chunk.updated}\nКритичность: {chunk.criticality}\nКонтент:\n{c}\n")
     
     context = "\n---\n".join(context_parts)
+    
+    # Логируем статистику очистки
+    log_m.info(json.dumps({"ev":"clean_section","orig_len":total_before,"clean_len":total_after,"reduced":total_before-total_after}, ensure_ascii=False))
     print(f"📝 Контекст для синтеза: {len(context)} символов")
     print(f"📝 Первые 200 символов контекста: {context[:200]}...")
     
