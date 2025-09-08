@@ -1,7 +1,17 @@
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
+
+# грузим .env вне зависимости от текущей рабочей директории
+env_loaded = load_dotenv(find_dotenv(), override=True)
+if not env_loaded:  # fallback: .env рядом с app.py
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
+
+from core.logging_setup import setup_logging
+LOG_INFO = setup_logging(project_root=Path(__file__).resolve().parent)
+
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from dotenv import load_dotenv
 import os
 import uuid
 import traceback
@@ -9,21 +19,11 @@ import re
 import json
 from openai import OpenAI
 
-# --- Logging setup (stdout + уровень из ENV) ---
-import logging, sys, os
-logging.basicConfig(level=logging.INFO)
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-root = logging.getLogger()
-if not root.handlers:
-    h = logging.StreamHandler(sys.stdout)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-    h.setFormatter(fmt)
-    root.addHandler(h)
-    root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 # приглушим болтливость werkzeug
+import logging
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logger = logging.getLogger("cesi")
-logger.info("✅ Логирование настроено (level=%s)", LOG_LEVEL)
+logger.info("✅ Логирование настроено (level=%s)", os.getenv("LOG_LEVEL", "INFO"))
 
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
@@ -40,8 +40,6 @@ def wants_json(req):
 
 from rag_engine import get_rag_answer
 from datetime import datetime, timezone, timedelta, time
-
-load_dotenv()  # Читает .env из корня проекта
 
 # Глобальные константы
 MAX_FINAL_CHARS = int(os.getenv("MAX_FINAL_CHARS", "800"))
@@ -389,6 +387,10 @@ def chat():
         from core.router import route_theme
         theme_hint = route_theme(message)  # Используем новый роутер
         
+        # Логируем запрос
+        from core.logger import log_query
+        log_query(message, session_id)
+        
         # 3. Получаем ответ от RAG
         rag_payload, rag_meta = get_rag_answer(normalized_query)
         
@@ -516,15 +518,38 @@ def chat():
                 from core.answer_builder import LOW_REL_JSON
                 return jsonify(LOW_REL_JSON), 200
             
-            # Структурное логирование для JSON-ветки
+            # Логируем ответ
             try:
+                from core.logger import log_response, log_minimal, format_candidates_for_log
+                
+                # Форматируем кандидатов для лога
+                candidates = []
+                if rag_meta.get("candidates_with_scores"):
+                    raw_candidates = []
+                    for item in rag_meta["candidates_with_scores"]:
+                        if isinstance(item, dict) and "chunk" in item:
+                            raw_candidates.append((item["chunk"], item.get("score", 0.0)))
+                    candidates = format_candidates_for_log(raw_candidates)
+                
+                log_response(message, candidates, len(final_text))
+                
+                # Минимальный лог
+                best_score = 0.0
+                if rag_meta.get("candidates_with_scores"):
+                    first_candidate = rag_meta["candidates_with_scores"][0]
+                    if isinstance(first_candidate, dict):
+                        best_score = first_candidate.get("score", 0.0)
+                
+                log_minimal(message, best_score, feature_flags.get("GUARD_THRESHOLD", 0.35), bool(resp.get("cta")), resp.get("guard_used", False))
+                
+                # Структурное логирование для JSON-ветки
                 from core.logger import log_bot_response, format_candidates_for_log
                 log_bot_response(
                     user_query=message,
                     response_data=resp,
                     theme_hint=theme_hint,
                     candidates=format_candidates_for_log(resp.get("candidates", [])),
-                    scores=resp.get("relevance_scores", {}),
+                    scores={},
                     relevance_score=resp.get("relevance_score"),
                     guard_threshold=feature_flags.get("GUARD_THRESHOLD", 0.35),
                     low_relevance=resp.get("guard_used", False),
@@ -553,25 +578,42 @@ def chat():
             
             # Логируем запрос для анализа (после троттлинга CTA)
             try:
+                # Логируем ответ в legacy режиме
+                from core.logger import log_response, log_minimal, format_candidates_for_log
+                cta_final = cta if cta and not throttled else None
+                
+                # Форматируем кандидатов для лога
+                candidates = []
+                if rag_meta.get("candidates_with_scores"):
+                    raw_candidates = []
+                    for item in rag_meta["candidates_with_scores"]:
+                        if isinstance(item, dict) and "chunk" in item:
+                            raw_candidates.append((item["chunk"], item.get("score", 0.0)))
+                    candidates = format_candidates_for_log(raw_candidates)
+                
+                log_response(message, candidates, len(adapted_response))
+                
+                # Минимальный лог
+                best_score = 0.0
+                if rag_meta.get("candidates_with_scores"):
+                    first_candidate = rag_meta["candidates_with_scores"][0]
+                    if isinstance(first_candidate, dict):
+                        best_score = first_candidate.get("score", 0.0)
+                
+                log_minimal(message, best_score, feature_flags.get("GUARD_THRESHOLD", 0.35), bool(cta_final), adapted_meta.get("guard_used", False))
+                
                 # Старое логирование (для совместимости)
                 from rag_engine import log_query_response
                 used_chunks = rag_meta.get("used_chunks", [])
-                cta_final = cta if cta and not throttled else None
                 log_query_response(message, adapted_response, {**rag_meta, "shown_cta": bool(cta_final)}, used_chunks)
                 
                 # Новое структурированное логирование
-                # Подготавливаем данные для логирования
-                log_response_data = adapted_meta if feature_flags.is_json_mode() else {
-                    "response": adapted_response, 
-                    "meta": adapted_meta.get("meta", rag_meta)
-                }
-                
                 log_bot_response(
                     user_query=message,
                     response_data=log_response_data,
                     theme_hint=theme_hint,
                     candidates=format_candidates_for_log(adapted_meta.get("candidates", [])),
-                    scores=adapted_meta.get("relevance_scores", {}),
+                    scores={},
                     relevance_score=adapted_meta.get("relevance_score"),
                     guard_threshold=feature_flags.get("GUARD_THRESHOLD", 0.35),
                     low_relevance=adapted_meta.get("guard_used", False),
@@ -681,12 +723,12 @@ def submit_lead():
 
 @app.route('/')
 def root():
-    return send_file('widget.html')
+    return send_file('static/tester.html')
 
 
 @app.route('/widget')
 def widget():
-    return send_file('widget.html')
+    return jsonify(ok=True, app="cesi-bot", message="Widget endpoint")
 
 
 @app.route('/widget-embed.js')
@@ -696,12 +738,12 @@ def widget_embed():
 
 @app.route('/demo')
 def demo():
-    return send_file('test-connection.html')
+    return jsonify(ok=True, app="cesi-bot", message="Demo endpoint")
 
 
 @app.route('/test-connection.html')
 def test_connection():
-    return send_file('test-connection.html')
+    return jsonify(ok=True, app="cesi-bot", message="Test connection endpoint")
 
 
 

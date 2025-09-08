@@ -5,10 +5,17 @@
 """
 
 import json
+import time
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from config.feature_flags import feature_flags
+
+# Именованные логгеры для разных типов логов
+log_q = logging.getLogger("cesi.queries")
+log_r = logging.getLogger("cesi.bot_responses")
+log_m = logging.getLogger("cesi.minimal_logs")
 
 
 def log_bot_response(
@@ -127,31 +134,58 @@ def _extract_evidence(response_data: Dict[str, Any]) -> Dict[str, Any]:
     return evidence
 
 
-def format_candidates_for_log(candidates: List[tuple]) -> List[Dict[str, Any]]:
+def log_query(q: str, session_id: str = None) -> None:
+    """Логирует запрос пользователя"""
+    log_q.info(json.dumps({"q": q, "session": session_id or "unknown"}, ensure_ascii=False))
+
+
+def log_response(q: str, candidates: List[Dict[str, Any]] = None, answer_len: int = 0) -> None:
+    """Логирует ответ бота"""
+    log_r.info(json.dumps({
+        "q": q, 
+        "candidates": candidates or [], 
+        "answer_len": answer_len
+    }, ensure_ascii=False))
+
+
+def log_minimal(q: str, best_score: float, threshold: float, cta: bool, low_rel: bool = False) -> None:
+    """Логирует минимальную информацию о запросе"""
+    log_m.info(json.dumps({
+        "q": q, 
+        "best": best_score, 
+        "thr": threshold, 
+        "cta": cta, 
+        "low_rel": low_rel
+    }, ensure_ascii=False))
+
+
+def format_candidates_for_log(candidates: list[Any], top: int | None = None):
     """
-    Форматирует кандидатов для логирования.
+    Универсальная функция для форматирования кандидатов в логах.
     
     Args:
-        candidates: Список (chunk, score) кортежей
+        candidates: Список кандидатов (кортежи, объекты, словари)
+        top: Максимальное количество кандидатов для логирования
     
     Returns:
         Список словарей с информацией о кандидатах
     """
-    formatted = []
-    
-    for chunk, score in candidates:
-        if hasattr(chunk, 'file_name') and hasattr(chunk, 'text'):
-            # Извлекаем заголовок из текста
-            h2_match = None
-            if hasattr(chunk, 'text'):
-                import re
-                h2_match = re.search(r'(?m)^##\s+(.+?)\s*$', chunk.text)
-            
-            formatted.append({
-                "file": chunk.file_name,
-                "h2": h2_match.group(1) if h2_match else "unknown",
-                "source": "chunk",
-                "score": score
-            })
-    
-    return formatted
+    out = []
+    def to_item(cand, rank):
+        # вариант 1: кортеж/список (chunk, score)
+        if isinstance(cand, (tuple, list)) and len(cand) >= 2:
+            chunk, score = cand[0], cand[1]
+        else:
+            chunk, score = cand, getattr(cand, "score", getattr(cand, "hybrid", getattr(cand, "rerank", None)))
+        h2  = getattr(chunk, "h2", getattr(chunk, "h2_id", None))
+        doc = getattr(chunk, "doc", getattr(chunk, "file", getattr(chunk, "doc_id", None)))
+        try:
+            s = float(score) if score is not None else None
+        except Exception:
+            s = None
+        return {"rank": rank, "score": s, "h2": h2, "doc": doc}
+    for i, c in enumerate(candidates, 1):
+        out.append(to_item(c, i))
+        if top and i >= top:
+            break
+    return out

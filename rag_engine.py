@@ -1244,9 +1244,9 @@ def retrieve_relevant_chunks(query: str, top_k: int = None) -> List[RetrievedChu
     
     # Мягкий матч (разделители -/-/- и пробелы)
     if not hit:
-        q2 = re.sub(r'[---]', '', q)
+        q2 = re.sub(r'[\-–—]', '', q)   # дефис/тире
         for alias, meta in ENTITY_INDEX.items():
-            a2 = re.sub(r'[---]', '', alias)
+            a2 = re.sub(r'[\-–—]', '', alias)   # дефис/тире
             if a2 in q2:
                 hit = ENTITY_CHUNKS.get((meta["topic"], meta["entity"]))
                 if not hit:
@@ -1876,10 +1876,16 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
         }
 
         # Логируем ответ в RAG
-        from core.logger import log_response, format_candidates_for_log
-        candidates = format_candidates_for_log(relevant_chunks[:3])  # Топ-3 кандидата
-        answer_text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
-        log_response(user_message, candidates, len(answer_text))
+        from core.logger import format_candidates_for_log
+        log_m = logging.getLogger("cesi.minimal_logs")
+        try:
+            log_m.info(json.dumps({
+                "ev":"search_candidates",
+                "count": len(relevant_chunks),
+                "cands": format_candidates_for_log(relevant_chunks, top=3)
+            }, ensure_ascii=False))
+        except Exception as e:
+            logging.getLogger("cesi").warning(f"log_format_error: {e}")
         
         return payload, rag_meta
         
