@@ -1426,12 +1426,14 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
     
     # Формируем контекст из чанков для LLM
     from core.text_clean import clean_section_for_prompt
+    from core.answer_shaping import should_verbatim, clamp_bullets, slice_for_prompt
     import json, logging
     log_m = logging.getLogger("cesi.minimal_logs")
     
     context_parts = []
     total_before, total_after = 0, 0
     cleaned = []
+    prepared_chunks = []
     
     for chunk in chunks:
         t = chunk.text
@@ -1439,7 +1441,16 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
         c = clean_section_for_prompt(t)
         total_after += len(c)
         cleaned.append(c)
-        context_parts.append(f"ID: {chunk.id}\nОбновлено: {chunk.updated}\nКритичность: {chunk.criticality}\nКонтент:\n{c}\n")
+        
+        # Применяем shaping для ответов
+        meta = getattr(chunk, "meta", {}) or {}
+        if should_verbatim(meta):
+            prepared = clamp_bullets(c, max_bullets=6)
+        else:
+            prepared = slice_for_prompt(c, limit_chars=900)
+        prepared_chunks.append(prepared)
+        
+        context_parts.append(f"ID: {chunk.id}\nОбновлено: {chunk.updated}\nКритичность: {chunk.criticality}\nКонтент:\n{prepared}\n")
     
     context = "\n---\n".join(context_parts)
     
@@ -1509,6 +1520,26 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
 }}
 """
 
+    # Жёсткий JSON-контракт с правилами краткости
+    SYSTEM_RULES = """
+Ты ассистент клиники. Отвечай спокойно и по делу.
+Только ЧИСТЫЙ JSON (без Markdown-фенсов).
+
+Запрещено:
+- оглавления, перечисление тем, H2/H3;
+- поля фронтматтера (title, aliases, mini_links, verbatim) и HTML-комментарии;
+- длинные копипасты из базы.
+
+Схема:
+{
+ "answer": "string, ≤700 символов, без оглавлений и списков тем",
+ "empathy": "string или ''",
+ "cta": {"show": true|false, "variant": "consult"},
+ "followups": [{"label":"string","query":"string"}]
+}
+Если уверен на <65%, задай 1 уточняющий вопрос в поле answer и не показывай CTA.
+"""
+
     completion = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,  # низкая температура для стабильности
@@ -1516,20 +1547,30 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
         top_p=0.8,       # ограничиваем выбор токенов
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": "Ты отвечаешь строго JSON по схеме {short, bullets[], cta, used_chunks, tone, warnings}. Никогда не используй Markdown заголовки в ответе."},
+            {"role": "system", "content": SYSTEM_RULES},
             {"role": "user", "content": system_prompt}
         ]
     )
     
     try:
         json_response = json.loads(completion.choices[0].message.content)
-        result_cta = json_response.get("cta", "")
+        
+        # Валидация и обрезка ответа
+        answer = json_response.get("answer", "Извините, давайте уточню…")
+        if len(answer) > 700:
+            answer = answer[:700] + "..."
+        
+        empathy = json_response.get("empathy", "")
+        cta = json_response.get("cta", {"show": False, "variant": "consult"})
         if not allow_cta:
-            result_cta = ""
+            cta = {"show": False, "variant": "consult"}
+        
+        followups = json_response.get("followups", [])
+        
         return SynthJSON(
-            short=json_response.get("short", ""),
-            bullets=json_response.get("bullets", []),
-            cta=result_cta,
+            short=answer,
+            bullets=[],  # Убираем bullets в пользу краткого answer
+            cta=cta.get("show", False),
             used_chunks=json_response.get("used_chunks", []),
             tone=json_response.get("tone", tone),
             warnings=json_response.get("warnings", [])
