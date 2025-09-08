@@ -9,6 +9,22 @@ import re
 import json
 from openai import OpenAI
 
+# --- Logging setup (stdout + уровень из ENV) ---
+import logging, sys, os
+logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+root = logging.getLogger()
+if not root.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    h.setFormatter(fmt)
+    root.addHandler(h)
+    root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+# приглушим болтливость werkzeug
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+logger = logging.getLogger("cesi")
+logger.info("✅ Логирование настроено (level=%s)", LOG_LEVEL)
+
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from collections import defaultdict
@@ -25,7 +41,11 @@ def wants_json(req):
 from rag_engine import get_rag_answer
 from datetime import datetime, timezone, timedelta, time
 
-load_dotenv()
+load_dotenv()  # Читает .env из корня проекта
+
+# Отладка ENV переменных
+print("DEBUG RESPONSE_MODE =", os.getenv("RESPONSE_MODE"))
+print("DEBUG ENABLE_EMPATHY =", os.getenv("ENABLE_EMPATHY"))
 
 # Инициализация OpenAI клиента v1
 try:
@@ -189,6 +209,37 @@ def gpt_cancellation_check(message):
         print(f"❌ Ошибка GPT-детекции отказов: {e}")
         return False
 
+def is_name_valid(message):
+    """
+    Проверяет, что введено имя, а не вопрос или жалоба.
+    """
+    message = message.strip().lower()
+    
+    # Слишком длинное - не имя
+    if len(message) > 50:
+        return False
+    
+    # Содержит вопросительные слова - не имя
+    question_words = ["что", "как", "где", "когда", "почему", "зачем", "сколько", "какой", "какая", "какие"]
+    if any(word in message for word in question_words):
+        return False
+    
+    # Содержит знаки препинания в середине - не имя
+    if any(punct in message for punct in ["?", "!", ".", ",", ":", ";"]):
+        return False
+    
+    # Содержит медицинские термины - не имя
+    medical_terms = ["болит", "зуб", "имплант", "лечение", "врач", "клиника", "стоимость", "цена", "больно", "страшно"]
+    if any(term in message for term in medical_terms):
+        return False
+    
+    # Содержит только буквы, пробелы и дефисы - похоже на имя
+    import re
+    if re.match(r'^[а-яё\s\-]+$', message):
+        return True
+    
+    return False
+
 def is_cancellation(message):
     """Гибридная детекция отказа от записи"""
     # Сначала быстрая проверка очевидных случаев
@@ -232,12 +283,20 @@ def chat():
                     "session_id": session_id
                 })
             
-            session["имя"] = message
-            session["state"] = "ожидание_телефона"
-            return jsonify({
-                "response": f"Приятно познакомиться, {message}! А номер телефона подскажете?",
-                "session_id": session_id
-            })
+            # Проверяем, что введено имя, а не вопрос/жалоба
+            if is_name_valid(message):
+                session["имя"] = message
+                session["state"] = "ожидание_телефона"
+                return jsonify({
+                    "response": f"Приятно познакомиться, {message}! А номер телефона подскажете?",
+                    "session_id": session_id
+                })
+            else:
+                # Если введен не вопрос, а что-то другое - переспрашиваем имя
+                return jsonify({
+                    "response": "Похоже, это не имя 🙂 Напишите, пожалуйста, как к вам обращаться (например: Иван Петров). Если пока неудобно — можем продолжить без записи.",
+                    "session_id": session_id
+                })
 
         if session.get("state") == "ожидание_телефона":
             # Проверяем отказ
@@ -311,12 +370,14 @@ def chat():
 
         # --- Обычная обработка через RAG ---
         # Импортируем новую систему
-        from core.legacy_adapter import adapt_rag_response
+        # Импортируем оба адаптера
+        from core import legacy_adapter
+        from core.answer_builder import postprocess as json_adapter
+        from config.feature_flags import feature_flags
         from core.rag_integration import enhance_rag_retrieval
         from core.router import theme_router
         from core.normalize import normalize_ru
         from core.logger import log_bot_response, format_candidates_for_log
-        from config.feature_flags import feature_flags
         
         # 1. Нормализация запроса
         normalized_query = normalize_ru(message)
@@ -326,7 +387,7 @@ def chat():
         theme_hint = route_theme(message)  # Используем новый роутер
         
         # 3. Получаем ответ от RAG
-        response, rag_meta = get_rag_answer(message)
+        rag_payload, rag_meta = get_rag_answer(normalized_query)
         
         # 4. Усиливаем кандидатов тематикой (если есть кандидаты)
         if rag_meta.get("candidates_with_scores"):
@@ -349,23 +410,121 @@ def chat():
             rag_meta.update(enh_meta or {})
         
         # 5. Адаптируем к новой системе (включает guard, followups, empathy)
-        # ✅ Извлекаем настоящие чанки из candidates_with_scores
-        chunks_only = [c["chunk"] for c in rag_meta.get("candidates_with_scores", [])]
+        # ✅ Извлекаем настоящие чанки из candidates_with_scores (с предохранителем)
+        raw = rag_meta.get("candidates_with_scores", [])
+        norm = []
+        for it in raw:
+            if isinstance(it, dict) and "chunk" in it:
+                norm.append((it["chunk"], it.get("score")))
+            elif isinstance(it, (list, tuple)) and len(it) >= 1:
+                norm.append((it[0], it[1] if len(it) > 1 else None))
+            else:
+                norm.append((it, None))
         
-        adapted_response, adapted_meta = adapt_rag_response(
-            user_query=message,
-            rag_response=response,
-            rag_meta=rag_meta,
-            relevant_chunks=chunks_only
-        )
+        chunks_only = [c for c, _ in norm]
+        
+        # Условная финализация ответа
+        if feature_flags.is_json_mode():
+            # Если rag_engine уже вернул готовый JSON — просто используем его
+            if isinstance(rag_payload, dict) and any(k in rag_payload for k in ("answer", "text", "final_text", "followups")):
+                adapted_meta = rag_payload
+            else:
+                # Иначе делаем постпроцесс один раз
+                adapted_meta = json_adapter(
+                    answer_text=(rag_payload.get("text") if isinstance(rag_payload, dict) else str(rag_payload or "")),
+                    user_text=message,
+                    intent=rag_meta.get("theme_hint"),
+                    topic_meta=rag_meta.get("meta", {}),
+                    session=session
+                )
+        else:
+            # Legacy режим
+            adapted_response, adapted_meta = legacy_adapter.adapt_rag_response(
+                user_query=message,
+                rag_response=rag_payload,
+                rag_meta=rag_meta,
+                relevant_chunks=chunks_only
+            )
         
         # Определяем формат ответа
-        # 1) если режим Legacy ИЛИ фронт не просит JSON -> отдаём чистый текст
-        if feature_flags.is_json_mode() and wants_json(request):
-            # Новый JSON формат - добавляем поле совместимости
-            if "response" not in adapted_meta:
-                adapted_meta["response"] = adapted_meta.get("answer", {}).get("short") or adapted_meta.get("text") or ""
-            return jsonify(adapted_meta), 200
+        # 1) если режим JSON -> ВСЕГДА отдаём JSON (независимо от Accept)
+        if feature_flags.is_json_mode():
+            # Нормализация payload (фикс для 'str'.get)
+            import re
+            
+            def _clean_text(s: str) -> str:
+                if not s: return ""
+                # 1) убрать HTML-комменты и aliases: [...]
+                s = re.sub(r'<!--.*?-->', '', s, flags=re.DOTALL)
+                s = re.sub(r'(?im)^\s*aliases\s*:\s*\[.*?\]\s*$', '', s)
+                # 2) убрать ### и ## в начале строк
+                s = re.sub(r'(?m)^\s*#{2,3}\s*', '', s)
+                # 3) схлопнуть лишние пустые строки
+                s = re.sub(r'\n{3,}', '\n\n', s)
+                # 4) убрать дубликаты первой строки
+                lines = [ln.strip() for ln in s.splitlines()]
+                if len(lines) >= 2 and lines[0] and lines[0] == lines[1]:
+                    lines.pop(1)
+                return "\n".join(lines).strip()
+            
+            def _as_payload(obj):
+                """Приводит любой ответ к единому JSON-формату."""
+                if isinstance(obj, dict): return obj
+                if isinstance(obj, str):
+                    t = _clean_text(obj)
+                    return {"response": {"text": t}, "text": t}
+                # на всякий случай – всё остальное в строку
+                t = _clean_text(str(obj))
+                return {"response": {"text": t}, "text": t}
+            
+            # Нормализуем то, что пришло из RAG
+            adapted_meta = _as_payload(rag_payload)
+            
+            # Берём финальный текст из postprocess: response.text
+            final_text = (
+                (adapted_meta.get("response") or {}).get("text")
+                or adapted_meta.get("final_text")
+                or adapted_meta.get("text")
+                or ""
+            )
+            final_text = _clean_text(final_text)
+            
+            # Собираем чистый ответ
+            resp = {
+                "response": final_text,  # строка
+                "text": final_text,
+                "cta": adapted_meta.get("cta") or None,
+                "followups": adapted_meta.get("followups") or [],
+            }
+            
+            # лог для контроля
+            logger.info({"ev": "return", "final_text_len": len(final_text), "keys": list(resp.keys())})
+            if not final_text:
+                # если вдруг где-то по дороге обнулили - честный каркас вместо фолбэка фронта
+                from core.answer_builder import LOW_REL_JSON
+                return jsonify(LOW_REL_JSON), 200
+            
+            # Структурное логирование для JSON-ветки
+            try:
+                from core.logger import log_bot_response, format_candidates_for_log
+                log_bot_response(
+                    user_query=message,
+                    response_data=resp,
+                    theme_hint=theme_hint,
+                    candidates=format_candidates_for_log(resp.get("candidates", [])),
+                    scores=resp.get("relevance_scores", {}),
+                    relevance_score=resp.get("relevance_score"),
+                    guard_threshold=feature_flags.get("GUARD_THRESHOLD", 0.35),
+                    low_relevance=resp.get("guard_used", False),
+                    shown_cta=bool(resp.get("cta")),
+                    followups_count=len(resp.get("followups", [])),
+                    opener_used=resp.get("opener_used", False),
+                    closer_used=resp.get("closer_used", False),
+                )
+            except Exception as e:
+                print(f"⚠️ Ошибка логирования(JSON): {e}")
+            
+            return jsonify(resp), 200
         else:
             # Legacy формат
             # Строим CTA для совместимости

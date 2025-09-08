@@ -6,7 +6,10 @@
 
 from typing import Dict, List, Optional, Any
 import json
+import re
 
+# Импорты для эмпатии и CTA
+from core import empathy, cta
 
 def build_json(
     short: str = "",
@@ -28,131 +31,208 @@ def build_json(
         body_md: Markdown контент (альтернатива short+bullets)
         cta_text: Текст призыва к действию
         cta_link: Ссылка для CTA
-        followups: Список связанных вопросов
-        used_chunks: ID использованных чанков
-        meta: Дополнительные метаданные
-        warnings: Предупреждения/ошибки
+        followups: Список follow-up вопросов
+        used_chunks: Список использованных чанков
+        meta: Метаданные ответа
+        warnings: Предупреждения
     
     Returns:
         Dict с полной структурой ответа
     """
-    
-    # Собираем секцию answer
-    answer = {
-        "short": short.strip() if short else "",
-        "bullets": bullets or [],
-        "body_md": body_md
-    }
-    
-    # Собираем CTA (только если есть и текст, и ссылка)
-    cta = {}
-    if cta_text and cta_link:
-        cta = {
-            "text": cta_text,
-            "link": cta_link,
-            "type": "primary"
-        }
-    
-    # Собираем метаданные
-    if meta is None:
-        meta = {}
-    
-    final_meta = {
-        "low_relevance": False,
-        "has_ui_cta": bool(cta_text and cta_link),
-        **meta
-    }
-    
-    # Собираем финальный ответ
     response = {
-        "answer": answer,
-        "cta": cta,
+        "version": "1.0",
+        "timestamp": meta.get("timestamp") if meta else None,
+        "response": {
+            "text": short,
+            "bullets": bullets or [],
+            "body_md": body_md
+        },
+        "cta": {
+            "text": cta_text,
+            "link": cta_link
+        } if cta_text else None,
         "followups": followups or [],
-        "used_chunks": used_chunks or [],
-        "meta": final_meta,
-        "warnings": warnings or []
+        "meta": {
+            "used_chunks": used_chunks or [],
+            "confidence": meta.get("confidence") if meta else None,
+            "source": meta.get("source") if meta else None,
+            "warnings": warnings or []
+        }
     }
+    
+    # Убираем None значения
+    response = {k: v for k, v in response.items() if v is not None}
+    if response.get("response"):
+        response["response"] = {k: v for k, v in response["response"].items() if v is not None}
+    if response.get("meta"):
+        response["meta"] = {k: v for k, v in response["meta"].items() if v is not None}
     
     return response
 
+# --- Back-compat для Legacy кода ---
+LOW_REL_JSON = {
+    "text": "Сейчас не могу ответить. Напишите вопрос чуть короче или позвоните нам.",
+    "meta": {"source": "guard", "relevance_score": None}
+}
 
-def build_low_relevance_json(
-    message: str = "К сожалению, в моей базе нет информации по этому вопросу.",
-    cta_text: Optional[str] = None,
-    cta_link: Optional[str] = None
-) -> Dict[str, Any]:
+def to_legacy_text(payload):
+    """Legacy UI ждёт plain text. Берём 'text' из payload."""
+    try:
+        return payload.get("text", "") if isinstance(payload, dict) else (payload or "")
+    except Exception:
+        return ""
+
+def postprocess(answer_text: str, user_text: str, intent: str, topic_meta: dict, session: dict) -> dict:
     """
-    Строит JSON для случаев низкой релевантности.
+    1) вставляем эмпатию-опенер или бридж (одна короткая строка)
+    2) решаем CTA (одна кнопка)
+    """
+    # 0. убедимся, что конфиги загружены (однократно)
+    if not hasattr(empathy, '_CFG') or not empathy._CFG:
+        empathy.load_config()
+    if not hasattr(cta, '_CFG') or not cta._CFG:
+        cta.load_config()
+    
+    # 1) эмпатия/бридж
+    opener_or_bridge = None
+    try:
+        opener_or_bridge = empathy.maybe_opener_or_bridge(
+            answer_text=answer_text,
+            user_text=user_text,
+            topic_meta=topic_meta or {},
+            session=session,
+            intent=intent
+        )
+    except Exception as e:
+        print(f"Empathy error: {e}")
+    
+    if opener_or_bridge:
+        answer_text = f"{answer_text}\n\n_{opener_or_bridge}_"
+    
+    # 2) CTA
+    cta_obj = None
+    try:
+        cta_obj = cta.decide_cta(
+            intent=intent,
+            topic_meta=topic_meta or {},
+            session=session
+        )
+    except Exception as e:
+        print(f"CTA error: {e}")
+    
+    # 3) сборка payload'а
+    payload = {"text": answer_text}
+    
+    if cta_obj:
+        payload["cta"] = cta_obj
+        
+        # если фронт пока legacy через action_buttons
+        if session.get("legacy_mode"):
+            btn = {
+                "text": cta_obj["label"],
+                "action": cta_obj.get("url"),
+                "variant": "primary"
+            }
+            payload["action_buttons"] = [btn]
+    
+    return payload
+
+def extract_bullets(text: str) -> List[str]:
+    """
+    Извлекает bullet points из текста.
+    Ищет строки, начинающиеся с -, *, • или цифр.
+    """
+    bullets = []
+    lines = text.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Проверяем различные форматы bullet points
+        if (line.startswith('- ') or 
+            line.startswith('* ') or 
+            line.startswith('• ') or
+            re.match(r'^\d+\.\s+', line)):
+            # Убираем маркер и добавляем в список
+            bullet = re.sub(r'^[-*•]\s+', '', line)
+            bullet = re.sub(r'^\d+\.\s+', '', bullet)
+            if bullet:
+                bullets.append(bullet)
+    
+    return bullets
+
+def format_response(response_data: Dict[str, Any], format_type: str = "json") -> str:
+    """
+    Форматирует ответ в нужном формате.
     
     Args:
-        message: Сообщение о низкой релевантности
-        cta_text: Текст CTA (опционально)
-        cta_link: Ссылка CTA (опционально)
+        response_data: Данные ответа
+        format_type: Тип форматирования ("json", "text", "markdown")
     
     Returns:
-        Dict с структурой ответа низкой релевантности
+        Отформатированная строка
     """
+    if format_type == "json":
+        return json.dumps(response_data, ensure_ascii=False, indent=2)
     
-    answer = {
-        "short": message,
-        "bullets": [],
-        "body_md": None
-    }
+    elif format_type == "text":
+        text_parts = []
+        
+        if response_data.get("response", {}).get("text"):
+            text_parts.append(response_data["response"]["text"])
+        
+        if response_data.get("response", {}).get("bullets"):
+            for bullet in response_data["response"]["bullets"]:
+                text_parts.append(f"• {bullet}")
+        
+        if response_data.get("cta", {}).get("text"):
+            text_parts.append(f"\n{response_data['cta']['text']}")
+        
+        return "\n".join(text_parts)
     
-    cta = {}
-    if cta_text and cta_link:
-        cta = {
-            "text": cta_text,
-            "link": cta_link,
-            "type": "primary"
-        }
+    elif format_type == "markdown":
+        md_parts = []
+        
+        if response_data.get("response", {}).get("text"):
+            md_parts.append(response_data["response"]["text"])
+        
+        if response_data.get("response", {}).get("bullets"):
+            md_parts.append("")
+            for bullet in response_data["response"]["bullets"]:
+                md_parts.append(f"- {bullet}")
+        
+        if response_data.get("cta", {}).get("text"):
+            md_parts.append(f"\n**{response_data['cta']['text']}**")
+        
+        return "\n".join(md_parts)
     
-    meta = {
-        "low_relevance": True,
-        "has_ui_cta": bool(cta_text and cta_link)
-    }
-    
-    return {
-        "answer": answer,
-        "cta": cta,
-        "followups": [],
-        "used_chunks": [],
-        "meta": meta,
-        "warnings": []
-    }
+    else:
+        raise ValueError(f"Unknown format type: {format_type}")
 
-
-def to_legacy_text(resp_json: Dict[str, Any]) -> str:
-    """
-    Конвертирует новый JSON-ответ в старый текстовый формат для обратной совместимости.
+# Legacy функции для обратной совместимости
+def build_legacy_response(text: str, bullets: List[str] = None, cta_text: str = None, cta_link: str = None) -> Dict[str, Any]:
+    """Строит ответ в старом формате для обратной совместимости."""
+    response = {"text": text}
     
-    Args:
-        resp_json: JSON-ответ в новом формате
-    
-    Returns:
-        Строка в старом формате
-    """
-    answer = resp_json.get("answer", {})
-    parts = []
-    
-    # Добавляем короткий ответ
-    short = answer.get("short", "").strip()
-    if short:
-        parts.append(short)
-    
-    # Добавляем bullets
-    bullets = answer.get("bullets", [])
     if bullets:
-        bullet_text = "\n• " + "\n• ".join(bullets)
-        parts.append(bullet_text)
+        response["bullets"] = bullets
     
-    # Возвращаем объединенный текст
-    return "\n".join([p for p in parts if p])
+    if cta_text:
+        response["cta"] = {"text": cta_text, "link": cta_link}
+    
+    return response
 
+# --- Back-compat для Legacy кода ---
+LOW_REL_JSON = {
+    "text": "Сейчас не могу ответить. Напишите вопрос чуть короче или позвоните нам.",
+    "meta": {"source": "guard", "relevance_score": None}
+}
 
-# Константы для feature flags
-LOW_REL_JSON = build_low_relevance_json(
-    "К сожалению, в моей базе нет информации по этому вопросу.",
-    "Записаться на консультацию"
-)
-
+def to_legacy_text(payload):
+    """Legacy UI ждёт plain text. Берём 'text' из payload."""
+    try:
+        return payload.get("text", "") if isinstance(payload, dict) else (payload or "")
+    except Exception:
+        return ""

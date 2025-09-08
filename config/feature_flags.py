@@ -18,7 +18,7 @@ class FeatureFlags:
         """Загружает флаги из переменных окружения."""
         return {
             # Режим ответа: json или legacy
-            "RESPONSE_MODE": os.getenv("RESPONSE_MODE", "legacy"),
+            "RESPONSE_MODE": os.getenv("RESPONSE_MODE", "json"),  # ← ИСПРАВЛЕНО
             
             # Включение новых функций
             "ENABLE_FOLLOWUPS": os.getenv("ENABLE_FOLLOWUPS", "false").lower() == "true",

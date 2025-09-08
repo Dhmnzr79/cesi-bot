@@ -4,6 +4,8 @@ doc_id: "faq-anesthesia-effectiveness"
 doc_type: "safety"
 topic: "safety"
 verbatim: false
+empathy_enabled: true
+empathy_tag: "fear_pain"
 aliases:
   - "анестезия не подействует"
   - "боюсь что анестезия не возьмет"

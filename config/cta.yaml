@@ -1,0 +1,40 @@
+version: 1
+cooldown_seconds: 90
+high_intent_override: true  # для price / fear_pain / indications / doctor / warranty
+high_intent_tags: ["price", "fear_pain", "indications", "doctor", "warranty"]
+
+default:
+  type: "consultation"
+  label: "Записаться на консультацию"
+  url: "/book?source=chat_default"
+
+intent_map:
+  price:
+    type: "consultation"
+    label: "Уточнить стоимость"
+    url: "/book?topic=pricing"
+  
+  fear_pain:
+    type: "consultation"
+    label: "Обсудить обезболивание"
+    url: "/book?topic=anesthesia"
+  
+  indications:
+    type: "consultation"
+    label: "Проверить показания"
+    url: "/book?topic=indications"
+  
+  duration:
+    type: "consultation"
+    label: "Сверить сроки"
+    url: "/book?topic=timeline"
+  
+  doctor:
+    type: "book_doctor"
+    label: "Записаться к врачу"
+    url: "/book?topic=doctor"
+  
+  warranty:
+    type: "consultation"
+    label: "Обсудить гарантию"
+    url: "/book?topic=warranty"

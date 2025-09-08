@@ -58,37 +58,59 @@ def strip_textual_cta(text: str, cta_text: Optional[str] = None) -> str:
     return cleaned_text
 
 
-def clean_response_text(text: str) -> str:
+def clean_response_text(s):
     """
     Очищает текст ответа от служебных элементов.
     
     Args:
-        text: Исходный текст
+        s: Исходный текст (может быть None, dict, str)
     
     Returns:
         Очищенный текст
     """
-    if not text:
-        return text
+    # защита от None/не-строк
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        try:
+            s = str(s)
+        except Exception:
+            return ""
     
-    cleaned = text
+    if not s:
+        return s
     
-    # Убираем служебные заголовки
-    cleaned = re.sub(r'^\s*#{1,6}\s*', '', cleaned, flags=re.MULTILINE)
+    # 1) убрать HTML-комментарии (в т.ч. aliases)
+    s = re.sub(r'<!--.*?-->', '', s, flags=re.DOTALL)
     
-    # Убираем служебные пометки
-    cleaned = re.sub(r'^(?:Ответ:|Инструкция:|JSON:|Промпт:)\s*', '', cleaned, flags=re.IGNORECASE | re.MULTILINE)
+    # 2) убрать Markdown-заголовки в тексте
+    s = re.sub(r'^\s*#{1,6}\s*', '', s, flags=re.MULTILINE)
     
-    # Убираем лишние пробелы
-    cleaned = re.sub(r'\s+', ' ', cleaned)
+    # 3) убрать «---» и одиночные маркеры
+    s = re.sub(r'^\s*---+\s*$', '', s, flags=re.MULTILINE)
+    s = re.sub(r'^\s*[-.]\s*$', '', s, flags=re.MULTILINE)
     
-    # Убираем кавычки в начале и конце
-    cleaned = re.sub(r'^["\']+|["\']+$', '', cleaned)
+    # 4) склеить множественные пробелы/переносы
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n{3,}', '\n\n', s)
     
-    # Нормализуем переносы строк
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    # 5) убрать повторы слов подряд (очень частый артефакт)
+    s = re.sub(r'(?i)\b([а-яёa-z0-9]{2,})(?:\s+\1){1,}\b', r'\1', s)
     
-    return cleaned.strip()
+    # 6) косметика тире
+    s = re.sub(r'\s*-\s*-\s*', '-', s)
+    
+    return s.strip()
+
+def clamp_text(s, max_chars=900, max_lines=14):
+    """Обрезает текст до разумных пределов"""
+    lines = [ln.strip() for ln in (s or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    
+    lines = lines[:max_lines]
+    s = '\n'.join(lines)
+    return (s[:max_chars] + '...') if len(s) > max_chars else s
 
 
 def enhance_bullets_formatting(bullets: list) -> list:

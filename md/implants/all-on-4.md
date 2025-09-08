@@ -3,6 +3,8 @@ title: "All-on-4"
 doc_type: "implants"
 topic: "implants"
 verbatim: true
+empathy_enabled: true
+empathy_tag: "indications"
 aliases:
   - "all on 4"
   - "all-on-four"

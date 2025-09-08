@@ -1,12 +1,10 @@
-# core/empathy_enhanced.py
-"""
-Улучшенный модуль эмпатии.
-Более точная детекция эмоций и контекстная эмпатия.
-"""
+# core/empathy_enhanced.py - DEPRECATED. Use core/empathy.py + core/answer_builder.postprocess
 
-import random
-from typing import Tuple, Dict, Any, Optional, List
-from .empathy import detect_emotion, build_answer
+def detect_emotion(*_a, **_kw): 
+    return None
+
+def build_answer(*_a, **_kw): 
+    raise NotImplementedError("Use core/answer_builder.postprocess")
 
 
 def detect_emotion_enhanced(

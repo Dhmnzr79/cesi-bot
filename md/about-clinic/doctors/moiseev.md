@@ -2,6 +2,8 @@
 title: "Моисеев Кирилл Николаевич"
 doc_type: "doctors"
 topic: "doctors"
+empathy_enabled: true
+empathy_tag: "doctor"
 aliases:
   - "моисеев кирилл николаевич"
   - "моисеев имплантолог"

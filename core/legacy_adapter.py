@@ -46,7 +46,8 @@ def process_query_with_new_system(
     user_query: str,
     relevant_chunks: list,
     rag_meta: Dict[str, Any],
-    candidates_with_scores: List[tuple] = None
+    candidates_with_scores: List[tuple] = None,
+    payload: Optional[dict | str] = None,  # + добавили
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Обрабатывает запрос с использованием новой системы.
@@ -61,6 +62,12 @@ def process_query_with_new_system(
         Tuple[response_text, response_metadata]
     """
     
+    # Перед postprocessing - достаём/нормализуем payload
+    if payload is None:
+        payload = rag_meta.get("response")  # мы кладём его выше в adapt_rag_response
+    if not isinstance(payload, dict):
+        payload = {"text": (str(payload) if payload is not None else "")}
+    
     # Нормализация запроса (если включена)
     if feature_flags.is_enabled("ENABLE_NORMALIZATION"):
         normalized_query = normalize_query_for_search(user_query)
@@ -70,6 +77,19 @@ def process_query_with_new_system(
     # Guard проверка (если включена)
     if feature_flags.is_enabled("ENABLE_GUARD"):
         from .guard import guard_with_candidates
+        
+        # Логируем meta до guard для диагностики
+        print(f"🔍 legacy_adapter: rag_meta.keys()={list(rag_meta.keys())}")
+        print(f"🔍 legacy_adapter: len(candidates_with_scores)={len(candidates_with_scores)}")
+        
+        # Диагностический лог перед guard
+        import logging
+        logger = logging.getLogger("cesi.legacy_adapter")
+        logger.info({
+            "ev": "pre-guard",
+            "cand_cnt": len(rag_meta.get("candidates_with_scores") or []),
+            "rel": rag_meta.get("relevance_score") or (rag_meta.get("meta") or {}).get("relevance_score"),
+        })
         
         # Используем кандидаты со скоррами если доступны
         if candidates_with_scores:
@@ -86,11 +106,25 @@ def process_query_with_new_system(
                 "rerank_top1": rag_meta.get("rerank_score", 0.0)
             }
             
-            should_use_guard, guard_response = should_use_guard_response(
-                scores, 
-                feature_flags.get("GUARD_THRESHOLD", 0.35),
-                rag_meta
-            )
+            # Байпас: если есть кандидаты - guard не нужен
+            cands = rag_meta.get("candidates_with_scores") or []
+            if len(cands) > 0:
+                should_use_guard, guard_response = False, None
+            else:
+                should_use_guard, guard_response = should_use_guard_response(
+                    scores, 
+                    feature_flags.get("GUARD_THRESHOLD", 0.35),
+                    rag_meta
+                )
+            
+            # на случай, если нижний слой вернул старый формат
+            if isinstance(guard_response, tuple) and len(guard_response) == 2:
+                payload, meta = guard_response
+                if isinstance(payload, dict):
+                    payload.setdefault("meta", {})
+                    payload["meta"].update(meta or {})
+                guard_response = payload
+            
             extracted_scores = scores
         
         if should_use_guard:
@@ -157,10 +191,17 @@ def process_query_with_new_system(
         followups = filter_followups(followups, current_h2_id, limit=3)
     
     # Post-processing перед сборкой JSON
-    from .postprocessing import clean_response_text, strip_textual_cta
+    from .postprocessing import clean_response_text, strip_textual_cta, clamp_text
     
     # Очищаем short и bullets
-    short = clean_response_text(rag_meta.get("response", ""))
+    # было (по стек-трейсу так и падало): 
+    # short = clean_response_text(rag_meta.get("response", ""))
+    # стало:
+    text = ( (payload.get("text") if isinstance(payload, dict) else None) 
+             or rag_meta.get("best_text")  # мы кладём его в rag_engine
+             or "" )
+    short = clean_response_text(text)
+    short = clamp_text(short)
     bullets = [clean_response_text(b) for b in rag_meta.get("bullets", [])]
     
     # Удаляем текстовые CTA если есть UI CTA
@@ -170,6 +211,10 @@ def process_query_with_new_system(
     # Строим JSON ответ
     meta = _json_safe_meta(extract_meta_from_frontmatter(frontmatter))
     meta["followups_position"] = "above_cta"  # подсказка фронту про порядок
+    
+    # финальный текст для виджета
+    final_text = short or text
+    payload["text"] = final_text
     
     json_response = build_json(
         short=short,
@@ -181,6 +226,19 @@ def process_query_with_new_system(
         meta=meta,
         warnings=rag_meta.get("warnings", [])
     )
+    
+    # Добавляем final_text для виджета
+    json_response["response_mode"] = "json"  # ← ИСПРАВЛЕНО
+    json_response["final_text"] = final_text
+    json_response["text"] = final_text  # ← ВАЖНО: некоторые фронты читают text
+    json_response["low_relevance"] = False  # + на бэку совместимость со старым фронтом
+    json_response["has_ui_cta"] = bool(payload.get("cta"))  # + чтобы фронт не думал, что это фолбэк
+    json_response["cta"] = payload.get("cta") or {}
+    
+    # Контрольный лог
+    import logging
+    logger = logging.getLogger("cesi.legacy_adapter")
+    logger.info({"ev":"finalize", "final_text_len": len(final_text), "has_cta": bool(payload.get("cta"))})
     
     # Валидация структуры (если включена)
     if feature_flags.is_enabled("POSTPROCESS_STRIP_TEXTUAL_CTA"):

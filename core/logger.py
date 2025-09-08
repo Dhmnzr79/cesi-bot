@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from config.feature_flags import feature_flags
 
 
 def log_bot_response(
@@ -68,7 +69,7 @@ def log_bot_response(
         "closer_used": closer_used,
         "followups_count": followups_count,
         "followups_labels": [f.get("label", "") for f in followups if isinstance(f, dict)],
-        "response_mode": "json" if "answer" in response_data else "legacy"
+        "response_mode": feature_flags.get("RESPONSE_MODE")
     }
     
     # Записываем в файл

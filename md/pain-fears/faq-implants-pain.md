@@ -4,6 +4,8 @@ doc_type: "safety"
 topic: "safety"
 verbatim: false
 preferred_format: ["detailed","bullets"]
+empathy_enabled: true
+empathy_tag: "fear_pain"
 aliases:
   - "имплантация больно"
   - "болезненно ли имплантация"

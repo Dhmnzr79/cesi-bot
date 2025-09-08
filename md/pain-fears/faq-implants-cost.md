@@ -4,6 +4,8 @@ doc_id: "faq-implants-cost"
 doc_type: "prices"
 topic: "prices"
 verbatim: true
+empathy_enabled: true
+empathy_tag: "price"
 aliases:
   - "почему имплантация дорогая"
   - "имплантация дорого"

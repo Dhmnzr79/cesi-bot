@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Any, Set, Tuple
 from textwrap import dedent
 from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz
-from core.empathy import detect_emotion, build_answer
+# from core.empathy import detect_emotion, build_answer  # Функции не используются в новом коде
 
 # ==== КОНСТАНТЫ ====
 CONFIG_DIR = Path("config")
@@ -88,14 +88,14 @@ def _slugify_implant_kind(name: str) -> str:
 
 load_dotenv()
 
-# Загрузка конфигов эмпатии
-with open(os.path.join("config", "empathy_config.yaml"), "r", encoding="utf-8") as f:
-    EMPATHY_CFG = yaml.safe_load(f)
-with open(os.path.join("config","empathy.yaml"), "r", encoding="utf-8") as f:
-    EMPATHY_BANK = yaml.safe_load(f)
-with open(os.path.join("config", "empathy_triggers.yaml"), "r", encoding="utf-8") as f:
-    EMPATHY_TRIGGERS = yaml.safe_load(f)
-_RNG = random.Random()
+# Загрузка конфигов эмпатии (старые конфиги - не используются в новой архитектуре)
+# with open(os.path.join("config", "empathy_config.yaml"), "r", encoding="utf-8") as f:
+#     EMPATHY_CFG = yaml.safe_load(f)
+# with open(os.path.join("config","empathy.yaml"), "r", encoding="utf-8") as f:
+#     EMPATHY_BANK = yaml.safe_load(f)
+# with open(os.path.join("config", "empathy_triggers.yaml"), "r", encoding="utf-8") as f:
+#     EMPATHY_TRIGGERS = yaml.safe_load(f)
+# _RNG = random.Random()
 
 # Инициализация OpenAI клиента v1
 try:
@@ -214,7 +214,7 @@ def register_file(file_name: str, md_text: str):
 DEFAULT_H2 = {
   "consultation": ("consultation-free.md",         "обзор"),
   "prices":       ("prices-clinic.md",             None),
-  "warranty":     ("warranty.md",                  "обзор"),
+  "warranty":     ("about-clinic/warranty.md",     "обзор"),
   "contacts":     ("clinic-contacts.md",           None),
   "implants":     ("implants-overview.md",         "обзор"),
   "safety":       ("implants-contraindications.md","обзор"),
@@ -273,6 +273,25 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
         h2_title = lines[0]
         h2_body = '\n'.join(lines[1:])
         
+        # Парсим H2-алиасы из HTML-комментариев
+        h2_aliases = []
+        h2_id = None
+        
+        # Ищем {#id} в заголовке
+        id_match = re.search(r'\{#([^}]+)\}', h2_title)
+        if id_match:
+            h2_id = id_match.group(1)
+            h2_title = re.sub(r'\s*\{#[^}]+\}\s*', '', h2_title).strip()
+        
+        # Ищем алиасы в первой строке после заголовка
+        if lines and len(lines) > 1:
+            first_line = lines[1].strip()
+            alias_match = re.search(r'<!--\s*aliases:\s*\[(.*?)\]\s*-->', first_line, re.IGNORECASE)
+            if alias_match:
+                aliases_str = alias_match.group(1)
+                # Парсим алиасы из строки
+                h2_aliases = [a.strip().strip('"\'') for a in re.split(r',\s*', aliases_str) if a.strip()]
+        
         # Если внутри есть Н3 режем по ним (### ...)
         h3_blocks = re.split(r'(?m)^\s*###\s+', block)
         if len(h3_blocks) > 1:
@@ -280,8 +299,17 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
             if h3_blocks[0].strip():
                 preamble_text = f"## {h2_title}\n{h3_blocks[0].strip()}"
                 chunk_id = f"{file_name}#{h2_title}_preamble"
-                temp_metadata = Frontmatter({})
-                chunks.append(RetrievedChunk(chunk_id, preamble_text.strip(), temp_metadata, file_name))
+                
+                # Создаем метаданные с H2-алиасами
+                temp_metadata = Frontmatter({
+                    "h2_id": h2_id,
+                    "h2_title": h2_title,
+                    "h2_aliases": h2_aliases
+                })
+                
+                # Включаем алиасы в индексируемый текст
+                index_text = f"{h2_title} " + " ".join(h2_aliases) + "\n" + preamble_text
+                chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
             
             # дальше создать чанки для каждого ### как сейчас
             for h3 in h3_blocks[1:]:
@@ -295,14 +323,32 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
                 
                 text = f"## {h2_title}\n### {h3_title}\n{h3_body}"
                 chunk_id = f"{file_name}#{h2_title}_{h3_title}"
-                temp_metadata = Frontmatter({})
-                chunks.append(RetrievedChunk(chunk_id, text.strip(), temp_metadata, file_name))
+                
+                # Создаем метаданные с H2-алиасами
+                temp_metadata = Frontmatter({
+                    "h2_id": h2_id,
+                    "h2_title": h2_title,
+                    "h2_aliases": h2_aliases
+                })
+                
+                # Включаем алиасы в индексируемый текст
+                index_text = f"{h2_title} " + " ".join(h2_aliases) + "\n" + text
+                chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
         else:
             # Н3 нет - сохраняем Н2 как единый чанк
             text = f"## {h2_title}\n{h2_body}"
             chunk_id = f"{file_name}#{h2_title}"
-            temp_metadata = Frontmatter({})
-            chunks.append(RetrievedChunk(chunk_id, text.strip(), temp_metadata, file_name))
+            
+            # Создаем метаданные с H2-алиасами
+            temp_metadata = Frontmatter({
+                "h2_id": h2_id,
+                "h2_title": h2_title,
+                "h2_aliases": h2_aliases
+            })
+            
+            # Включаем алиасы в индексируемый текст
+            index_text = f"{h2_title} " + " ".join(h2_aliases) + "\n" + text
+            chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
     
     return chunks
 
@@ -450,35 +496,12 @@ def build_empathy_prompt(tone: str = "friendly", emotion: str = "empathy", allow
     
     return prompt
 
-def postprocess_answer_with_empathy(base_text: str, tone: str = "friendly", emotion: str = "empathy", cta_text: str | None = None, cta_link: str | None = None) -> str:
-    """Делает финальную «оживляющую» переформулировку ответа. Если LLM недоступна/ошибка — возвращает исходный base_text."""
-    
-    try:
-        allow_emoji = True  # вместо random.random() < 0.33
-        
-        system_prompt = build_empathy_prompt(tone, emotion, allow_emoji, cta_text, cta_link)
-        
-        completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.2,  # еще меньше креативности
-            top_p=0.8,       # ограничить выбор токенов
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": base_text}
-            ]
-        )
-        
-        text = completion.choices[0].message.content.strip()
-        
-        # Постобработка
-        text = re.sub(r'^\s*#{1,6}\s*', '', text, flags=re.MULTILINE)  # убираем заголовки
-        text = re.sub(r'\n{3,}', '\n\n', text)  # нормализуем переносы
-        
-        return text
-        
-    except Exception as e:
-        print(f"Постпроцессор не сработал: {e}")
-        return base_text
+# Back-compat функция для старого кода
+from core.answer_builder import postprocess, LOW_REL_JSON
+
+def postprocess_answer_with_empathy(answer_text, user_text, intent, topic_meta, session):
+    """Back-compat: используем новый постпроцессор."""
+    return postprocess(answer_text, user_text, intent, topic_meta, session)
 
 def theme_boost(score: float, theme_key: str, cfg: dict, chunk) -> float:
     # бустим, если в тегах или тексте есть тематические алиасы
@@ -535,7 +558,7 @@ def fallback_theme_chunks(theme_key: str, limit: int = 3):
     
     print(f"🔍 Fallback для темы '{theme_key}': ищем теги {cfg['tag_aliases']}")
     
-    for ch in all_chunks:
+    for ch in ALL_CHUNKS:
         tags_l = getattr(ch.metadata, 'tags_lower', [])
         text_l = ch.text.lower()
         
@@ -769,11 +792,14 @@ try:
     print(f"✅ H2_INDEX: {len(H2_INDEX)} заголовков")
     print(f"✅ FILE_META: {len(FILE_META)} файлов")
     
+    # Логируем статистику индексов
+    print(f"📊 INDEX STATS: docs={len(FILE_META)}, chunks={len(ALL_CHUNKS)}, aliases={len(ALIAS_MAP_GLOBAL)}, h2s={len(H2_INDEX)}")
+    
     # Создаем BM25 индекс
-    if all_chunks:
-        print(f"🔍 Создаем BM25 индекс для {len(all_chunks)} чанков...")
+    if ALL_CHUNKS:
+        print(f"🔍 Создаем BM25 индекс для {len(ALL_CHUNKS)} чанков...")
         bm25_corpus = []
-        for chunk in all_chunks:
+        for chunk in ALL_CHUNKS:
             # Токенизируем текст для BM25
             tokens = re.findall(r'\w+', chunk.text.lower())
             bm25_corpus.append(tokens)
@@ -782,7 +808,7 @@ try:
         print(f"✅ BM25 индекс создан")
     
     # Отладочная информация о чанках
-    for chunk in all_chunks[:5]:  # Показываем первые 5 чанков
+    for chunk in ALL_CHUNKS[:5]:  # Показываем первые 5 чанков
         print(f"  📄 {chunk.file_name}: {chunk.text[:80]}...")
     
     # Пересобираем regex для врачей
@@ -811,14 +837,14 @@ try:
         globals()['get_embedding'] = get_embedding
         
         # Создаем эмбеддинги только для текста чанков
-        chunk_texts = [chunk.text for chunk in all_chunks]
+        chunk_texts = [chunk.text for chunk in ALL_CHUNKS]
         embeddings = [get_embedding(text) for text in chunk_texts]
         
         dimension = len(embeddings[0])
         index = faiss.IndexFlatL2(dimension)
         index.add(np.array(embeddings).astype("float32"))
         
-        print(f"✅ Индекс создан с {len(all_chunks)} чанками")
+        print(f"✅ Индекс создан с {len(ALL_CHUNKS)} чанками")
 
 except Exception as e:
     print(f"❌ Критическая ошибка при инициализации: {e}")
@@ -1005,6 +1031,17 @@ def llm_rerank(candidates: List[Tuple[RetrievedChunk, float]], query: str) -> Li
         print(f"❌ Ошибка LLM-реранкинга: {e}")
         return candidates
 
+def select_chunk_by_alias(chunks: List[RetrievedChunk], query: str) -> RetrievedChunk | None:
+    """Форс-матч по алиасам перед финальным выбором чанка"""
+    ql = query.lower()
+    for chunk in chunks:
+        h2_aliases = getattr(chunk.metadata, 'h2_aliases', []) or []
+        for alias in h2_aliases:
+            al = alias.lower()
+            if al == ql or al in ql:
+                return chunk
+    return None
+
 def reranker(candidates: List[Tuple[RetrievedChunk, float]], query: str, detected_topics: Set[str]) -> List[RetrievedChunk]:
     """Реранкер с LLM-оценкой релевантности"""
     if not candidates:
@@ -1059,31 +1096,42 @@ def detect_section_early(user_q: str):
 # === 7) Главная функция ретрива ===
 def retrieve_relevant_chunks_new(user_q: str, theme_hint: str|None, candidates_func):
     """Новая функция ретрива с приоритетным поиском"""
+    print(f"🔍 NEW ENGINE: query='{user_q}', theme_hint='{theme_hint}'")
+    
     # 1) точный H2
     ch, flags = detect_section_early(user_q)
-    if ch: return [ch], flags
+    if ch: 
+        print(f"✅ H2 match found: {ch.id}")
+        return [ch], flags
 
-    # 2) глобальный алиас из шапок → дефолт по теме
-    a = ALIAS_MAP_GLOBAL.get(norm_text(user_q))
-    if not a:
-        for k, v in ALIAS_MAP_GLOBAL.items():
-            if k in norm_text(user_q): a = v; break
-    if a:
-        ch, flags = get_default_chunk_for_topic(a["topic"])
-        if ch: return [ch], {"source":"alias","exact_h2_match":True,"topic":a["topic"]}
+    # 2) глобальный алиас из шапок → дефолт по теме (ОТКЛЮЧЕН)
+    # a = ALIAS_MAP_GLOBAL.get(norm_text(user_q))
+    # if not a:
+    #     for k, v in ALIAS_MAP_GLOBAL.items():
+    #         if k in norm_text(user_q): a = v; break
+    # if a:
+    #     ch, flags = get_default_chunk_for_topic(a["topic"])
+    #     if ch: 
+    #         print(f"✅ Alias match found: {a['topic']} -> {ch.id}")
+    #         return [ch], {"source":"alias","exact_h2_match":True,"topic":a["topic"]}
 
     # 3) тема из роутера → дефолт темы
     if theme_hint in CANON:
         ch, flags = get_default_chunk_for_topic(theme_hint)
-        if ch: return [ch], flags
+        if ch: 
+            print(f"✅ Theme match found: {theme_hint} -> {ch.id}")
+            return [ch], flags
 
     # 4) обычный поиск (ваша существующая функция выдаёт кандидатов)
     cands = candidates_func(user_q)
+    print(f"🔍 Search candidates: {len(cands)} found")
     return cands, {"source":"search","exact_h2_match":False}
 
-def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]:
+def retrieve_relevant_chunks(query: str, top_k: int = None) -> List[RetrievedChunk]:
+    if top_k is None:
+        top_k = int(os.getenv("RAG_TOP_K", 5))  # было 8, теперь 5 по умолчанию
     """Извлекает релевантные чанки с multi-query rewrite и улучшенным ранжированием"""
-    if len(all_chunks) == 0:
+    if len(ALL_CHUNKS) == 0:
         print("⚠️ Нет чанков для поиска")
         return []
     
@@ -1091,23 +1139,23 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
     detected_topics = route_topics(query)
     print(f"🎯 Роутер определил темы: {detected_topics}")
     
-    # Прямой alias-fallback по карте frontmatter
-    q = _norm(query or "")
-    hit_map = ALIAS_MAP.get(q)
-    if not hit_map:
-        # допускаем "alias ⊆ query" (например, запрос длиннее)
-        for a, meta in ALIAS_MAP.items():
-            if a and a in q:
-                hit_map = meta
-                break
-
-    if hit_map:
-        # находим первый чанк соответствующего файла и возвращаем его
-        target = Path(hit_map["file"]).name
-        for ch in all_chunks:
-            if ch.file_name == target:
-                print(f"✅ Alias-fallback: {q} -> {hit_map['file']}")
-                return [ch]
+    # Прямой alias-fallback по карте frontmatter (ОТКЛЮЧЕН)
+    # q = _norm(query or "")
+    # hit_map = ALIAS_MAP.get(q)
+    # if not hit_map:
+    #     # допускаем "alias ⊆ query" (например, запрос длиннее)
+    #     for a, meta in ALIAS_MAP.items():
+    #         if a and a in q:
+    #             hit_map = meta
+    #             break
+    #
+    # if hit_map:
+    #     # находим первый чанк соответствующего файла и возвращаем его
+    #     target = Path(hit_map["file"]).name
+    #     for ch in ALL_CHUNKS:
+    #         if ch.file_name == target:
+    #             print(f"✅ Alias-fallback: {q} -> {hit_map['file']}")
+    #             return [ch]
     
     # ==== БЫСТРЫЙ ПУТЬ: ДЕТЕКТ СУЩНОСТИ ====
     q = _norm(query or "")
@@ -1190,9 +1238,15 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
         
         print(f"🔍 Multi-query: объединено {len(unique_candidates)} уникальных кандидатов")
         
-        # ==== РЕРАНКЕР ====
-        final_chunks = reranker(top_candidates, query, detected_topics)
-        print(f"🔍 Реранкер отобрал {len(final_chunks)} финальных чанков")
+        # ==== ФОРС-МАТЧ ПО АЛИАСАМ ====
+        forced_chunk = select_chunk_by_alias([chunk for chunk, _ in top_candidates], query)
+        if forced_chunk:
+            print(f"🎯 Форс-матч по алиасу: {forced_chunk.id}")
+            final_chunks = [forced_chunk]
+        else:
+            # ==== РЕРАНКЕР ====
+            final_chunks = reranker(top_candidates, query, detected_topics)
+            print(f"🔍 Реранкер отобрал {len(final_chunks)} финальных чанков")
         
         # если ничего внятного не попало и тема известна — жёсткий fallback
         if not final_chunks and detected_topics:
@@ -1221,7 +1275,40 @@ def retrieve_relevant_chunks(query: str, top_k: int = 8) -> List[RetrievedChunk]
 def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, allow_cta: bool) -> SynthJSON:
     """Синтезирует структурированный JSON ответ"""
     
-    # Формируем контекст из чанков
+    # Определяем метаданные для ответа (берем из первого чанка)
+    primary_chunk = chunks[0] if chunks else None
+    tone = primary_chunk.metadata.tone if primary_chunk else "friendly"
+    preferred_format = primary_chunk.metadata.preferred_format if primary_chunk else ["short", "bullets", "cta"]
+    verbatim = primary_chunk.metadata.verbatim if primary_chunk else False
+    
+    # Если verbatim: true - отдаем текст "как есть" без LLM
+    if verbatim:
+        print(f"📝 Verbatim режим: отдаем текст без LLM пересказа")
+        
+        # Извлекаем bullets из текста
+        bullets = []
+        for chunk in chunks:
+            lines = chunk.text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.startswith('- ') or line.startswith('* '):
+                    bullet = line[2:].strip()
+                    if bullet:
+                        bullets.append(bullet)
+    
+    # CTA для промпта (только если разрешен)
+    cta_for_prompt = (primary_chunk.metadata.cta_text if (primary_chunk and allow_cta) else "")
+    
+    return {
+            "short": "Информация по вашему запросу:",
+            "bullets": bullets,
+            "cta": cta_for_prompt if cta_for_prompt else None,
+            "used_chunks": [chunk.id for chunk in chunks],
+            "tone": tone,
+            "warnings": []
+        }
+    
+    # Формируем контекст из чанков для LLM
     context_parts = []
     for chunk in chunks:
         context_parts.append(f"ID: {chunk.id}\nОбновлено: {chunk.updated}\nКритичность: {chunk.criticality}\nКонтент:\n{chunk.text}\n")
@@ -1230,60 +1317,16 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, allow_cta: 
     print(f"📝 Контекст для синтеза: {len(context)} символов")
     print(f"📝 Первые 200 символов контекста: {context[:200]}...")
     
-    # Определяем метаданные для ответа (берем из первого чанка)
-    primary_chunk = chunks[0] if chunks else None
-    tone = primary_chunk.metadata.tone if primary_chunk else "friendly"
-    preferred_format = primary_chunk.metadata.preferred_format if primary_chunk else ["short", "bullets", "cta"]
-    verbatim = primary_chunk.metadata.verbatim if primary_chunk else False
-    
     # CTA для промпта (только если разрешен)
     cta_for_prompt = (primary_chunk.metadata.cta_text if (primary_chunk and allow_cta) else "")
     
-    # Системный промпт с учетом verbatim
-    if verbatim:
-        system_prompt = f"""
-Ты — дружелюбный и внимательный ассистент стоматологической клиники ЦЭСИ на Камчатке.
-Твоя задача — отвечать на вопросы пациентов строго по фактам из базы знаний.
-
-Правила:
-0. ТОЛЬКО факты из контекста, без выдумок
-1. Коротко и по делу
-2. Пункты/списки
-3. Если в контексте есть числа/сроки — НЕ изменять
-4. Без эмпатии/общих фраз — только факты
-5. Без служебных символов Markdown в ответе пользователю
-6. Разбивай текст на абзацы и смысловые блоки
-7. Если информации нет — честно скажи об этом
-
-## Контекст для ответа:
-{context}
-
-## Вопрос пользователя:
-{user_query}
-
-## Метаданные:
-- Тон: {tone}
-- Предпочтительный формат: {preferred_format}
-{f"- CTA текст: {cta_for_prompt}" if cta_for_prompt else ""}
-
-Отвечай строго в формате JSON:
-{{
-    "short": "Короткий ответ по сути вопроса",
-    "bullets": ["Деталь 1", "Деталь 2", "Деталь 3"],
-    "cta": "Мягкий призыв к действию",
-    "used_chunks": ["ID1", "ID2"],
-    "tone": "{tone}",
-    "warnings": []
-}}
-"""
-    else:
-        # Адаптивная логика для verbatim: false файлов
-        format_instruction = ""
-        if "detailed" in preferred_format:
-            format_instruction = "\n\nВАЖНО: Дай развернутый, подробный ответ с максимальным количеством деталей и объяснений. Пользователь нуждается в полной информации."
-        elif "short" in preferred_format:
-            format_instruction = "\n\nВАЖНО: Дай краткий, лаконичный ответ по сути вопроса. Без лишних деталей."
-        
+    # Адаптивная логика для verbatim: false файлов
+    format_instruction = ""
+    if "detailed" in preferred_format:
+        format_instruction = "\n\nВАЖНО: Дай развернутый, подробный ответ с максимальным количеством деталей и объяснений. Пользователь нуждается в полной информации."
+    elif "short" in preferred_format:
+        format_instruction = "\n\nВАЖНО: Дай краткий, лаконичный ответ по сути вопроса. Без лишних деталей."
+    
         system_prompt = f"""
 Ты — дружелюбный и внимательный ассистент стоматологической клиники ЦЭСИ на Камчатке.
 Твоя задача — отвечать на вопросы пациентов просто, понятно и с заботой, но строго по делу и на основе базы знаний.
@@ -1421,6 +1464,10 @@ def render_markdown(synth: SynthJSON) -> str:
     
     def clean_text(text: str) -> str:
         """Очищает текст от служебных символов и инструкций"""
+        # Проверяем, что text - это строка
+        if not isinstance(text, str):
+            text = str(text) if text is not None else ""
+        
         # Убираем служебные символы и инструкции
         cleaned = re.sub(r'^(?:\*|Ответ:|Инструкция:|JSON:|Промпт:)\s*', '', text, flags=re.IGNORECASE)
         # Убираем Markdown заголовки
@@ -1432,12 +1479,12 @@ def render_markdown(synth: SynthJSON) -> str:
         return cleaned.strip()
     
     # Очищаем и форматируем части
-    short = clean_text(synth.short)
-    cta = clean_text(synth.cta)
+    short = clean_text(synth.get("short", ""))
+    cta = clean_text(synth.get("cta", ""))
     
     # Форматируем bullets
     bullets = []
-    for bullet in synth.bullets:
+    for bullet in synth.get("bullets", []):
         clean_bullet = clean_text(bullet)
         if clean_bullet and len(clean_bullet) > 5:  # Минимальная длина
             bullets.append(f"- {clean_bullet}")
@@ -1475,244 +1522,263 @@ def render_markdown(synth: SynthJSON) -> str:
 # Основная функция
 def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, dict]:
     """Основная функция для получения ответа и метаданных"""
-    # ✅ Заводим переменные-флаги для bypass guard
-    alias_used = False
-    doctor_hit = False
-    exact_h2 = False
+    from logging import getLogger
+    import json
+    logger = getLogger("cesi.rag")
+    logger.info("➡️ Новый вопрос: %s", user_message)
     
-    # Увеличиваем top_k для поиска врачей
-    if DOCTOR_REGEX and DOCTOR_REGEX.search(user_message):
-        top_k = 12
-        print(f"🔍 Поиск врачей: используем top_k={top_k}")
-    else:
-        top_k = 8  # немного шире по умолчанию
+    # Всегда инициализируем — чтобы не ловить UnboundLocalError
+    detected_topics = []
+    theme_hint = None
+    rag_meta = {"user_query": user_message}
     
-    # Извлекаем релевантные чанки
-    relevant_chunks = retrieve_relevant_chunks(user_message, top_k=top_k)
+    try:
+        # --- 1) Явный оверрайд темы по ключевым словам (если используешь root_aliases.yaml)
+        try:
+            import yaml
+            ROOT = yaml.safe_load(open("config/root_aliases.yaml", "r", encoding="utf-8")) or {}
+            ql = user_message.lower()
+            for doc_type, keys in (ROOT.get("root_aliases") or {}).items():
+                if any(k in ql for k in keys):
+                    theme_hint = doc_type
+                    break
+        except Exception:
+            pass
     
-    # Если нет кандидатов, пробуем alias fallback
-    if not relevant_chunks:
-        from core.md_loader import alias_fallback
-        fallback_candidates = alias_fallback(user_message)
-        if fallback_candidates:
-            # ✅ Когда срабатывает alias-fallback — ставим alias_used = True
-            alias_used = True
-            print(f"✅ Alias fallback сработал: {len(fallback_candidates)} кандидатов")
+        # --- 2) Авто-детект темы (если оверрайд не дал тему)
+        if theme_hint is None:
+            try:
+                detected_topics = list(route_topics(user_message))
+                print(f"🎯 Роутер определил темы: {detected_topics}")
+            except Exception:
+                detected_topics = []
             
-            # Создаем фиктивные чанки для fallback
-            from dataclasses import dataclass
-            @dataclass
-            class FallbackChunk:
-                id: str
-                text: str
-                file_name: str
-                metadata: object
-                score: float = 1.0
-            
-            relevant_chunks = []
-            for candidate in fallback_candidates:
-                # Читаем файл и создаем чанк
-                try:
-                    with open(candidate["file"], 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    chunk = FallbackChunk(
-                        id=candidate["file"],
-                        text=content,
-                        file_name=candidate["file"].split('/')[-1],
-                        metadata=type('obj', (object,), {'h2_id': candidate["h2_id"]}),
-                        score=candidate["score"]
-                    )
-                    relevant_chunks.append(chunk)
-                except:
-                    continue
-    
-    if not relevant_chunks:
-        return """К сожалению, в моей базе нет информации по этому вопросу.
+            if detected_topics:
+                theme_hint = detected_topics[0]
 
-Запишитесь на бесплатную консультацию — наш специалист ответит на все ваши вопросы.""", {}
-    
-    # Логируем кандидатов для отладки
-    print("🔍 CANDIDATES:")
-    for i, chunk in enumerate(relevant_chunks[:5]):
-        print(f"  {i+1}. {chunk.file_name}: {chunk.text[:100]}...")
-    
-    # Формируем candidates_with_scores для новой системы
-    candidates_with_scores = []
-    for chunk in relevant_chunks:
-        candidates_with_scores.append({
-            "chunk": chunk,
-            "score": getattr(chunk, 'score', 0.5),  # Базовый скор
-            "doc_id": chunk.id,
-            "file_name": chunk.file_name,
-            "topic": getattr(chunk.metadata, 'topic', None),
-            "h2_id": getattr(chunk.metadata, 'h2_id', None)
-        })
-    
-    # ✅ Определяем doctor_hit и exact_h2
-    if relevant_chunks:
-        primary_chunk = relevant_chunks[0]
-        # Проверяем, является ли это карточкой врача
-        if hasattr(primary_chunk.metadata, 'doc_type') and primary_chunk.metadata.doc_type in ('doctor', 'doctors'):
-            doctor_hit = True
-            print(f"✅ Doctor card hit: {primary_chunk.file_name}")
+        # --- 2.5) Быстрый путь по алиасам (ВРЕМЕННО ОТКЛЮЧЕН)
+        # q_norm = norm_text(user_message)
+        # if q_norm in ALIAS_MAP_GLOBAL:
+        #     key = ALIAS_MAP_GLOBAL[q_norm]
+        #     # найдём чанк по файлу и/или якорю Н2
+        #     ch = _find_chunk(key["file"], key.get("primary_h2_id"))
+        #     if ch:
+        #         topic_meta = getattr(ch.metadata, '__dict__', {}) or {}
+        #         payload = postprocess(
+        #             answer_text=ch.text,
+        #             user_text=user_message,
+        #             intent=theme_hint or key.get("topic"),
+        #             topic_meta=topic_meta,
+        #             session={},
+        #         )
+        #         return payload, {"user_query": user_message, "theme_hint": theme_hint, "fast_path": "alias"}
+
+        # --- 3) Ретривал (2 прохода: с темой → без темы)
+        # Увеличиваем top_k для поиска врачей
+        if DOCTOR_REGEX and DOCTOR_REGEX.search(user_message):
+            top_k = 12
+            print(f"🔍 Поиск врачей: используем top_k={top_k}")
+        else:
+            top_k = int(os.getenv("RAG_TOP_K", 5))  # было 8, теперь 5 по умолчанию
         
-        # Проверяем точное совпадение H2 заголовка
-        if hasattr(primary_chunk.metadata, 'h2_id') and primary_chunk.metadata.h2_id:
-            # Можно добавить более сложную логику для exact_h2_match
-            exact_h2 = True
-            print(f"✅ Exact H2 match: {primary_chunk.metadata.h2_id}")
-    
-    # Сразу после получения relevant_chunks вычисляем флаги разрешений
-    primary_chunk = relevant_chunks[0] if relevant_chunks else None
-    doc_type = (primary_chunk.metadata.doc_type if primary_chunk else "info")
-    _cfg = EMPATHY_CFG.get("features", {})
-
-    allow_cta       = _cfg.get("cta_enabled", True) and doc_type not in set(_cfg.get("disable_cta_on_doc_types", []))
-    allow_post      = _cfg.get("postprocess_enabled", True) and doc_type not in set(_cfg.get("disable_postprocess_on_doc_types", []))
-    allow_empathy   = _cfg.get("empathy_enabled", True) and doc_type not in set(_cfg.get("disable_empathy_on_doc_types", []))
-    
-    # Синтезируем структурированный ответ
-    synth_response = synthesize_answer(relevant_chunks, user_message, allow_cta)
-    
-    # Рендерим в Markdown
-    markdown_response = render_markdown(synth_response)
-    
-    # ==== ЭМПАТИЯ ====
-    # Определяем эмоцию на основе запроса и контекста
-    retrieved_snippet = "\n".join([ch.text[:200] for ch in relevant_chunks[:3]])
-    fm = {}
-    if relevant_chunks:
-        try:
-            meta = relevant_chunks[0].metadata
-            fm = {
-                "emotion": getattr(meta, "emotion", None),
-                "verbatim": getattr(meta, "verbatim", False),
-                "doc_type": getattr(meta, "doc_type", None)
-            }
-        except Exception:
-            pass
-    
-    emotion, detector, confidence = detect_emotion(
-        user_query=user_message,
-        retrieved_snippet=retrieved_snippet,
-        fm=fm,
-        empathy_cfg=EMPATHY_CFG,
-        triggers_bank=EMPATHY_TRIGGERS,
-        llm_client=openai_client,
-        model="gpt-4o-mini"
-    )
-    
-    # Собираем финальный текст с эмпатией
-    core_text = markdown_response
-    
-    # --- CTA
-    cta_text = primary_chunk.metadata.cta_text if primary_chunk else None
-    cta_link = primary_chunk.metadata.cta_link if primary_chunk else None
-    if not allow_cta:
-        cta_text, cta_link = None, None
-    
-    # --- Postprocess
-    final_text = core_text
-    if allow_post:
-        final_text = postprocess_answer_with_empathy(
-            base_text=core_text, tone="friendly", emotion=emotion, cta_text=cta_text, cta_link=cta_link
+        # Извлекаем релевантные чанки (используем новую логику)
+        logger.info("🔎 theme_hint=%s detected_topics=%s", theme_hint, detected_topics)
+        relevant_chunks, meta_flags = retrieve_relevant_chunks_new(
+            user_message, 
+            theme_hint=theme_hint,
+            candidates_func=lambda q: retrieve_relevant_chunks(q, top_k=top_k)
         )
-    
-    # --- Empathy
-    if allow_empathy:
-        final_text = build_answer(final_text, emotion, EMPATHY_BANK, EMPATHY_CFG, _RNG)
-    
-    # Постпроцессор: не даём «пустых» ответов
-    if not relevant_chunks or len(markdown_response.strip()) < 40:
-        print(f"⚠️ Пустой ответ, пробуем тематический fallback...")
-        # Попробуем достать тематический факт для боли/цены/гарантии
-        detected_topics = route_topics(user_message)
-        print(f"🔍 Обнаружены темы: {detected_topics}")
-        if detected_topics:
-            theme_key = list(detected_topics)[0]
-            fb = fallback_theme_chunks(theme_key, limit=2)
-            print(f"🔍 Fallback чанков: {len(fb)}")
-            if fb:
-                markdown_response = "\n\n".join(ch.text.strip() for ch in fb if ch and ch.text)[:1200]
-                print(f"✅ Fallback применен, новый размер: {len(markdown_response)} символов")
-            else:
-                print(f"❌ Fallback не сработал для темы: {theme_key}")
-    
-    # Собираем метаданные из первого чанка для CTA
-    rag_meta = {}
-    cta_text = None
-    cta_link = None
-    
-    for ch in relevant_chunks:
-        try:
-            meta = ch.metadata
-            if getattr(meta, "cta_text", None): cta_text = meta.cta_text
-            if getattr(meta, "cta_link", None): cta_link = meta.cta_link
+        
+        # Мини-фильтр по теме (минимум логики, максимум эффекта)
+        def filter_candidates(theme: str, q: str, cands: list):
+            t = (q or "").lower()
             
-            # Собираем метаданные для CTA
-            rag_meta = {
-                "topic": getattr(meta, "topic", None),
-                "doc_type": getattr(meta, "doc_type", None),
-                "section": getattr(meta, "section", None),
-                "cta_action": getattr(meta, "cta_action", None),
-                "cta_text": cta_text,
-                "cta_link": cta_link
+            def h2_of(c):
+                return (getattr(c, "h2", None) or getattr(c, "meta", {}).get("h2", "") or "").lower()
+            
+            def text_of(c):
+                return (getattr(c, "text", "") or "").lower()
+            
+            # «приживаемость» — оставляем только куски, где явно есть прижив/оссео
+            if any(k in t for k in ["прижив", "приживаем", "оссео"]):
+                return [c for c in cands if any(x in h2_of(c) + " " + text_of(c) for x in ["прижив", "оссеоинтегр"])]
+            
+            # страх/боль — выкидываем «противопоказания»
+            if any(k in t for k in ["боюсь", "боль", "страшно", "анестез", "обезбол"]):
+                bad = ["противопоказан", "противопоказания"]
+                return [c for c in cands if not any(x in h2_of(c) for x in bad)]
+            
+            return cands
+        
+        relevant_chunks = filter_candidates(theme_hint, user_message, relevant_chunks)
+        
+        # Лёгкий переранж (чтобы «нужное» всплывало первым)
+        def bonus_for_query(c, q):
+            t = (getattr(c, "text", "") or "").lower()
+            b = 0.0
+            
+            # прижив/оссео
+            if "прижив" in q or "оссео" in q:
+                if any(x in t for x in ["прижив", "оссеоинтегр"]): b += 0.1
+            
+            # боязнь/боль
+            if any(x in q for x in ["боюсь", "боль", "анестез", "обезбол"]):
+                if any(x in t for x in ["без боли", "анестез", "обезбол"]): b += 0.1
+            
+            return b
+        
+        for c in relevant_chunks:
+            base = getattr(c, "score", 0.0)  # твоя косинус/БМ25
+            c.score = float(base) + bonus_for_query(c, user_message.lower())
+        
+        relevant_chunks = sorted(relevant_chunks, key=lambda x: x.score, reverse=True)
+        
+        # Быстрая диагностика (чтобы понять причину)
+        for i, c in enumerate(relevant_chunks[:5], 1):
+            logger.info({
+                "ev": "rerank_top",
+                "rank": i,
+                "score": round(getattr(c, "score", 0.0), 3),
+                "h2": getattr(c, "h2", None) or getattr(c, "meta", {}).get("h2"),
+                "doc": getattr(c, "meta", {}).get("doc_id"),
+            })
+        
+        # Если нет кандидатов, пробуем без темы
+        if not relevant_chunks:
+            logger.info("⚠️ Первый проход не дал результатов, пробуем без темы...")
+            relevant_chunks, meta_flags = retrieve_relevant_chunks_new(
+                user_message, 
+                theme_hint=None,
+                candidates_func=lambda q: retrieve_relevant_chunks(q, top_k=top_k)
+            )
+        
+        # Логируем результат
+        logger.info("📦 candidates=%d", len(relevant_chunks))
+        logger.info("🔍 rag_engine: relevant_chunks[0] type=%s", type(relevant_chunks[0]) if relevant_chunks else "None")
+        
+        if not relevant_chunks:
+            # честный низкий релеванс
+            return LOW_REL_JSON.copy(), rag_meta
+
+        # --- 4) Сборка текста (твоя логика извлечения лучшего чанка)
+        best_chunk = relevant_chunks[0]
+        answer_text = best_chunk.text  # или как у тебя
+
+        # --- 4.5) Guard-fallback для «боль/страх»
+        cand_cnt = len(relevant_chunks)
+        if cand_cnt == 0:
+            return LOW_REL_JSON.copy(), {"meta": {"relevance_score": 0.0, "cand_cnt": 0}}
+
+        best = relevant_chunks[0]
+        best_score = getattr(best, "score", 0.0)
+        
+        # Если после фильтра/переранжировки лучший скор слабый — отдай готовый «эмпатичный» ответ
+        if theme_hint in ("safety", "pain", "fear_pain") and best_score < 0.42:
+            payload = {
+                "response": {"text": "Понимаю, что страшит именно боль. Процедура делается под местной анестезией – во время операции вы ничего не почувствуете.\n\nПосле – обычно как после удаления зуба: даём обезболивающее и сопровождаем.\n\nЕсли хотите, врач коротко расскажет, как всё проходит именно в вашем случае."},
+                "cta": {"label": "Записаться на консультацию", "target": "whatsapp"},
+                "followups": ["Сколько длится приём?", "Какая анестезия используется?"]
             }
-            break  # берем только из первого чанка
-        except Exception:
-            pass
-    
-    # Применяем анти-флуфф фильтр к финальному тексту
-    final_text = strip_fluff_start(final_text)
-    
-    # ==== ANSWER COMPRESSION ====
-    if len(final_text) > 800:  # Сжимаем только длинные ответы
-        final_text = compress_answer(final_text, max_length=800)
-    
-    # Отладочная информация
-    print(f"🔍 Вопрос: '{user_message}'")
-    print(f"📄 Найдено чанков: {len(relevant_chunks)}")
-    for i, chunk in enumerate(relevant_chunks[:3]):  # Показываем первые 3
-        print(f"  {i+1}. {chunk.file_name}: {chunk.text[:100]}...")
-    print(f"📝 Ответ: {final_text[:200]}...")
-    
-    # Добавляем used_chunks в метаданные
-    used_ids = [ch.id for ch in relevant_chunks]
-    rag_meta["used_chunks"] = used_ids
-    rag_meta["candidates_with_scores"] = candidates_with_scores
-    
-    # ✅ Добавляем флаги для bypass guard
-    rag_meta.update({
-        "used_chunks": [
-            {
-                "file": chunk.file_name,
-                "h2_id": getattr(chunk.metadata, "h2_id", None),
-                "score": getattr(chunk, "score", 0.0)
+            return payload, {**rag_meta, "guard_used": True, "relevance_score": best_score}
+        
+        score = None
+        
+        # Пытаемся извлечь score из чанка
+        for key in ["score", "rank_score", "bm25_score", "similarity"]:
+            if isinstance(best, dict) and key in best:
+                score = best[key]
+                break
+            elif hasattr(best, key):
+                score = getattr(best, key)
+                break
+        
+        # Если score нет - ставим разумный дефолт
+        if score is None:
+            score = 0.7  # если нет score - даем безопасный дефолт
+        
+        # Если это форс-совпадение по алиасу - повышаем score
+        if isinstance(best, dict) and (best.get("forced_by_alias") or best.get("h2_alias_hit")):
+            score = max(score, 0.9)  # если это был форс-алиас (если у вас есть такой флаг)
+
+        # --- 5) Постпроцесс: эмпатия/бридж + CTA
+        topic_meta = getattr(best_chunk.metadata, '__dict__', {}) or {}
+        intent = theme_hint  # или твой интент-детектор
+        payload = postprocess(
+            answer_text=answer_text,
+            user_text=user_message,
+            intent=intent,
+            topic_meta=topic_meta,
+            session={},  # session пока пустой
+        )
+        
+        # Подстраховка для payload
+        if not isinstance(payload, dict):
+            payload = {"text": str(payload) if payload is not None else best_text}
+        elif not payload.get("text"):
+            payload["text"] = best_text
+
+        # Обновляем метаданные с relevance_score
+        def _mget(meta, key, default=None):
+            """Безопасный доступ к метаданным: dict/obj"""
+            if meta is None:
+                return default
+            if isinstance(meta, dict):
+                return meta.get(key, default)
+            return getattr(meta, key, default)
+        
+        def _score_of(c):
+            """Пытаемся получить скор из разных полей; если нет - None"""
+            for k in ("score", "rank_score", "bm25_score", "similarity"):
+                v = c[k] if isinstance(c, dict) and k in c else getattr(c, k, None)
+                if v is not None:
+                    return v
+            return None
+        
+        cand_cnt = len(relevant_chunks)
+        best = relevant_chunks[0]
+        meta = getattr(best, "metadata", None) or getattr(best, "meta", {}) or {}
+        best_text = getattr(best, "section_text", None) or getattr(best, "text", "") or ""
+        # минимальная очистка прямо тут (та же, что в clean_response_text, но короткая)
+        import re
+        best_text = re.sub(r'<!--.*?>', '', best_text, flags=re.DOTALL)
+        best_text = re.sub(r'^\s*#{1,6}\s*', '', best_text, flags=re.MULTILINE)
+        best_text = best_text.strip()
+        rag_meta["best_text"] = best_text
+        score = _score_of(best)
+        if score is None:
+            score = 0.7  # дефолт, чтобы guard не резал нормальный ответ
+        best_chunk_id = f"{_mget(meta, 'file_basename','')}" + (f"#{_mget(meta, 'h2_id','')}" if _mget(meta, 'h2_id') else "")
+        
+        # ВАЖНО: список словарей {"chunk": ..., "score": ... } – именно так ждёт адаптер/арр.ру
+        candidates_with_scores = [
+            {"chunk": c, "score": _score_of(c)}
+            for c in relevant_chunks[:5]
+        ]
+        
+        # rag_meta плоские поля (+ вложенный meta для guard - на всякий случай)
+        rag_meta = {
+            "relevance_score": float(score),
+            "cand_cnt": cand_cnt,
+            "theme_hint": theme_hint,
+            "detected_topics": detected_topics,
+            "best_chunk_id": best_chunk_id,
+            "candidates_with_scores": candidates_with_scores,
+            "best_text": best_text,  # пригодится адаптеру как fallback
+            "meta": {
+                "relevance_score": float(score),
+                "cand_cnt": cand_cnt,
+                "doc_type": _mget(meta, "doc_type"),
+                "topic": _mget(meta, "topic"),
+                "best_chunk_id": best_chunk_id,
             }
-            for chunk in relevant_chunks
-        ],
-        # флаги для bypass guard
-        "source": "alias" if alias_used else "search",
-        "doctor_card_hit": doctor_hit,
-        "exact_h2_match": exact_h2,
-    })
-    
-    # Добавляем поля эмпатии в метаданные
-    rag_meta.update({
-        "emotion": emotion,
-        "detector": detector,
-        "confidence": round(float(confidence), 2),
-        "opener_used": (emotion != "none" and any(final_text.startswith(x) for x in EMPATHY_BANK.get(emotion, {}).get("openers", []))),
-        "closer_used": (emotion != "none" and any(final_text.endswith(x) for x in EMPATHY_BANK.get(emotion, {}).get("closers", []))),
-        # SAFE-режим статусы
-        "empathy_enabled": allow_empathy,
-        "postprocess_enabled": allow_post,
-        "cta_enabled": allow_cta
-    })
-    
-    print(f"📋 Метаданные: {rag_meta}")
-    
-    return final_text, rag_meta
+        }
+
+        return payload, rag_meta
+        
+    except Exception:
+        # Никогда не падаем наружу — лог и безопасный ответ
+        logger.exception("💥 get_rag_answer failed")
+        return LOW_REL_JSON.copy(), rag_meta
 
 def log_query_response(user_message: str, response: str, metadata: dict, chunks_used: List[str] = None):
     """Логирует вопрос/ответ в файл для анализа"""
@@ -1729,12 +1795,12 @@ def log_query_response(user_message: str, response: str, metadata: dict, chunks_
         "has_cta": bool(metadata.get("cta_action")),
         "topic": metadata.get("topic", "unknown"),
         "doc_type": metadata.get("doc_type", "unknown"),
-        # Поля эмпатии для отладки
-        "emotion": metadata.get("emotion", "none"),
-        "emotion_source": metadata.get("detector", "unknown"),
-        "emotion_confidence": metadata.get("confidence", 0.0),
-        "opener_used": metadata.get("opener_used", False),
-        "closer_used": metadata.get("closer_used", False)
+        # Поля эмпатии для отладки (старая логика - заменена на новую)
+        # "emotion": metadata.get("emotion", "none"),
+        # "emotion_source": metadata.get("detector", "unknown"),
+        # "emotion_confidence": metadata.get("confidence", 0.0),
+        # "opener_used": metadata.get("opener_used", False),
+        # "closer_used": metadata.get("closer_used", False)
     }
     
     try:

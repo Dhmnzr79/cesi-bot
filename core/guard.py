@@ -5,7 +5,10 @@
 """
 
 from typing import Dict, Tuple, Any, Optional, List
-from .answer_builder import LOW_REL_JSON
+try:
+    from .answer_builder import LOW_REL_JSON
+except Exception:
+    LOW_REL_JSON = {"text": "Сейчас не могу ответить. Напишите вопрос чуть короче или позвоните нам."}
 
 
 def _extract_score(item: Any) -> Optional[float]:
@@ -18,29 +21,18 @@ def _extract_score(item: Any) -> Optional[float]:
     Returns:
         Скорр или None если не найден
     """
-    # Старый формат: (chunk, score)
-    if isinstance(item, (tuple, list)) and len(item) >= 2:
-        return float(item[1])
+    # поддерживаем оба формата: {"chunk":..., "score":...} И (chunk, score)
+    if isinstance(item, dict):
+        s = item.get("score")
+    elif isinstance(item, (list, tuple)) and len(item) > 1:
+        s = item[1]
+    else:
+        s = None
     
-    # Новый формат: {"chunk": ..., "score": ...}
-    if isinstance(item, dict) and "score" in item:
-        return float(item["score"])
-    
-    # Альтернативный формат: {"scores": {"final": ..., "bm25": ..., ...}}
-    if isinstance(item, dict) and "scores" in item:
-        scores_dict = item["scores"]
-        for key in ["final", "bm25", "dense", "rerank", "top1", "relevance"]:
-            if key in scores_dict:
-                return float(scores_dict[key])
-    
-    # Объект с атрибутом score
-    if hasattr(item, "score"):
-        try:
-            return float(getattr(item, "score"))
-        except (ValueError, TypeError):
-            return None
-    
-    return None
+    try:
+        return float(s) if s is not None else None
+    except Exception:
+        return None
 
 
 def extract_scores_from_candidates(candidates: List[Any], top_n: int = 3) -> Dict[str, float]:
@@ -157,6 +149,13 @@ def apply_guard_with_bypasses(
     return is_low_relevance, relevance_score
 
 
+def _meta(m):
+    """Нормализует метаданные - поддерживает оба формата: {"meta":{...}} и просто {...}"""
+    if not isinstance(m, dict):
+        return {}
+    # поддерживаем оба формата: {"meta":{...}} и просто {...}
+    return m.get("meta") if "meta" in m and isinstance(m["meta"], dict) else m
+
 def should_use_guard_response(
     scores: Dict[str, float], 
     threshold: float = 0.35,
@@ -173,6 +172,31 @@ def should_use_guard_response(
     Returns:
         Tuple[should_use_guard, guard_response_json]
     """
+    def _meta(d):
+        if not isinstance(d, dict):
+            return {}
+        return d["meta"] if isinstance(d.get("meta"), dict) else d
+    
+    m = _meta(meta or {})
+    cand_cnt = int(m.get("cand_cnt", 0) or 0)
+    if cand_cnt > 0:
+        # Диагностический лог
+        import logging
+        logger = logging.getLogger("cesi.guard")
+        logger.info({"ev":"guard_decision", "use_guard": False,
+                     "cand_cnt": cand_cnt, "rel": m.get("relevance_score")})
+        return False, None  # кандидаты есть → guard не нужен
+    
+    # Нормализуем метаданные
+    meta = _meta(meta or {})
+    relevance_score = meta.get("relevance_score")
+    doc_type = meta.get("doc_type") or meta.get("topic")
+    
+    # если есть кандидаты и скор >= порога — guard НЕ нужен
+    if cand_cnt and (relevance_score is None or float(relevance_score) >= threshold):
+        print(f"✅ Guard bypass: cand_cnt={cand_cnt}, relevance_score={relevance_score}, threshold={threshold}")
+        return False, None
+    
     is_low_relevance, relevance_score = apply_guard_with_bypasses(scores, threshold, meta)
     
     if is_low_relevance:
@@ -187,6 +211,7 @@ def should_use_guard_response(
         
         # Возвращаем стандартный guard-ответ
         guard_response = LOW_REL_JSON.copy()
+        guard_response.setdefault("meta", {})
         guard_response["meta"]["relevance_score"] = relevance_score
         guard_response["meta"]["guard_threshold"] = threshold
         return True, guard_response

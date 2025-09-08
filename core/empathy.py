@@ -1,95 +1,124 @@
-import random
-from typing import Tuple, Dict, Any
+# core/empathy.py
+from __future__ import annotations
+import re, time, random, yaml, os
+from typing import Optional, Dict, Any
 
-def triggers_match(user_query: str, triggers: Dict[str, list[str]]) -> Tuple[str | None, bool]:
-    q = user_query.lower()
-    for cat, kws in triggers.items():
-        if any(kw in q for kw in kws):
-            return cat, True
-    return None, False
+_CFG = None
+_TRIGGERS = None
+_DOC_TAG_MAP = None
 
-def llm_classify(user_query: str, snippet: str, llm_client, model: str, emotion_categories: list = None) -> Tuple[str | None, float]:
-    if emotion_categories is None:
-        emotion_categories = ["pain", "price", "trust", "consultation", "osseointegration", "safety", "none"]
+def _load_yaml(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+def load_config(base_dir="config"):
+    global _CFG, _TRIGGERS, _DOC_TAG_MAP
+    _CFG = _load_yaml(os.path.join(base_dir, "empathy.yaml"))
+    _TRIGGERS = _load_yaml(os.path.join(base_dir, "empathy_triggers.yaml"))
+    # опциональная карта "документ/слаг -> тег"
+    _DOC_TAG_MAP = (_CFG or {}).get("doc_tag_map", {})
+    return _CFG
+
+def _now() -> float:
+    return time.time()
+
+def detect_tag_from_text(user_text: str) -> Optional[str]:
+    if not _TRIGGERS:
+        return None
+    t = user_text.lower()
+    for tag, stems in (_TRIGGERS.get("triggers") or {}).items():
+        for s in stems:
+            if s in t:
+                return tag
+    return None
+
+def infer_tag_from_doc(topic_meta: Dict[str, Any]) -> Optional[str]:
+    if not topic_meta:
+        return None
     
-    prompt = {"role": "system",
-              "content": 'Ты классифицируешь эмоцию пациента. Верни ТОЛЬКО JSON: {"category":"...", "confidence":0..1}.'}
-    user = {"role": "user",
-            "content": f"Вопрос: <<{user_query}>>\nКонтекст: <<{snippet[:800]}>>\n"
-                       f"Категории: {', '.join(emotion_categories)}"}
+    # 1) явный фронтматтер
+    if topic_meta.get("empathy_tag"):
+        return topic_meta["empathy_tag"]
     
-    try:
-        resp = llm_client.chat.completions.create(
-            model=model,
-            messages=[prompt, user],
-            response_format={"type": "json_object"}
-        )
-        data = resp.choices[0].message.parsed or {}
-        cat = (data.get("category") or "none").lower()
-        conf = float(data.get("confidence", 0))
-        valid = set(emotion_categories)
-        return (cat if cat in valid else "none", conf)
-    except Exception as e:
-        print(f"❌ Ошибка в llm_classify: {e}")
-        print(f"   Prompt: {prompt}")
-        print(f"   User: {user}")
-        print(f"   Response: {resp.choices[0].message.content if 'resp' in locals() else 'No response'}")
-        return (None, 0.0)
+    # 2) по пути/слагу из карты
+    slug = (topic_meta.get("slug") or "").lower()
+    path = (topic_meta.get("path") or "").lower().replace(".md","")
+    
+    if slug and slug in _DOC_TAG_MAP:
+        return _DOC_TAG_MAP[slug]
+    if path and path in _DOC_TAG_MAP:
+        return _DOC_TAG_MAP[path]
+    
+    return None
 
-def detect_emotion(user_query: str, retrieved_snippet: str, fm: Dict[str, Any],
-                   empathy_cfg: Dict[str, Any], triggers_bank: Dict[str, list[str]],
-                   llm_client=None, model="gpt-4o-mini") -> Tuple[str, str, float]:
-    # 1) жёсткие стопы
-    if fm.get("verbatim"):
-        return ("none", "verbatim", 1.0)
-    if fm.get("doc_type") in set(empathy_cfg["topics"].get("blocked_hard", [])):
-        return ("none", "hard_block", 1.0)
+def _has_prices(answer_text: str) -> bool:
+    # цифры + ₽/руб/тыс — простая эвристика
+    return bool(re.search(r"(\d[\d\s]{0,6})(₽|руб|тыс)", answer_text.lower()))
 
-    # 2) явная пометка в MD
-    fm_emotion = (fm.get("emotion") or "none").lower()
-    if fm_emotion != "none":
-        return (fm_emotion, "frontmatter", 1.0)
+def maybe_opener_or_bridge(answer_text: str, user_text: str, topic_meta: Dict[str, Any], session: Dict[str, Any], intent: Optional[str]) -> Optional[str]:
+    """
+    Вернёт строку (эмпатия-опенер ИЛИ бридж), либо None.
+    """
+    if not os.getenv("ENABLE_EMPATHY", "true").lower() == "true":
+        return None
+    
+    settings = (_CFG or {}).get("settings", {})
+    cooldown = int(os.getenv("EMPATHY_COOLDOWN_SECONDS", settings.get("cooldown_seconds", 60)))
+    blocklist = set((settings.get("blocklist_doc_tags") or []))
+    
+    doc_tag = topic_meta.get("doc_tag") or topic_meta.get("tag")
+    if doc_tag in blocklist:
+        return None
+    
+    last_ts = session.get("empathy_last_ts")
+    if last_ts and (_now() - last_ts) < cooldown:
+        return None
+    
+    # 1) определить финальный тег
+    tag = intent or infer_tag_from_doc(topic_meta) or detect_tag_from_text(user_text) or "neutral"
+    
+    # 1.5) эмпатия на цене без цифр — отключаем по флагу
+    if tag == "price" and os.getenv("EMPATHY_FOR_PRICE", "false") == "false" and not _has_prices(answer_text):
+        return None
+    
+    # 2) цена/сроки: если в ответе конкретика — бридж вместо эмпатии
+    if tag in ("price","duration") and _has_prices(answer_text) and os.getenv("ENABLE_PRICE_BRIDGE","true") == "true":
+        bridges = (((_CFG or {}).get("phrases") or {}).get(tag) or {}).get("bridges") or []
+        if bridges:
+            phrase = _pick_non_repeating(tag, bridges, session)
+            _mark_empathy_used(session, tag, phrase)
+            return phrase
+        # если бриджей нет — ничего не вставляем
+        return None
+    
+    # 3) ограничение повторов по тегу
+    max_consecutive = int(((_CFG or {}).get("settings", {})).get("max_consecutive_tag", 2))
+    recent = session.get("empathy_recent", [])
+    recent_tags = [t for (t, _p) in recent[-max_consecutive:]]
+    if len(recent_tags) == max_consecutive and all(t == tag for t in recent_tags):
+        return None
+    
+    # 4) обычный опенер
+    openers = (((_CFG or {}).get("phrases") or {}).get(tag) or {}).get("openers") or []
+    if not openers:
+        return None
+    
+    phrase = _pick_non_repeating(tag, openers, session)
+    _mark_empathy_used(session, tag, phrase)
+    return phrase
 
-    mode = empathy_cfg.get("mode", "hybrid")
-    soft_blocked = fm.get("doc_type") in set(empathy_cfg["topics"].get("blocked_soft", []))
+def _pick_non_repeating(tag: str, pool: list[str], session: Dict[str, Any]) -> Optional[str]:
+    used = session.get("empathy_recent", [])  # [(tag, phrase)]
+    
+    # не повторять последнюю фразу
+    pool2 = [p for p in pool if not used or p != used[-1][1]]
+    
+    choice = random.choice(pool2 or pool) if pool else None
+    return choice
 
-    # 3) триггеры / LLM
-    trig_cat, trig_hit = triggers_match(user_query, triggers_bank)
-    llm_cat, llm_conf = (None, 0.0)
-    if mode in ("llm", "hybrid") and llm_client and (not trig_hit or mode == "llm"):
-        emotion_categories = empathy_cfg.get("emotion_categories", ["pain", "price", "trust", "consultation", "osseointegration", "safety", "none"])
-        llm_cat, llm_conf = llm_classify(user_query, retrieved_snippet, llm_client, model, emotion_categories)
-
-    # 4) мягкая блокировка с «пробоем»
-    if soft_blocked:
-        if empathy_cfg["override"].get("allow_on_soft_block", True):
-            if trig_hit and empathy_cfg["override"].get("triggers_allow_override", True):
-                return (trig_cat, "triggers_override", 1.0)
-            if llm_cat and llm_conf >= float(empathy_cfg["override"].get("llm_min_confidence", 0.75)):
-                return (llm_cat, "llm_override", llm_conf)
-        return ("none", "soft_block", max(llm_conf, 0.0))
-
-    # 5) обычные темы
-    if mode == "triggers":
-        return (trig_cat if trig_hit else "none", "triggers", 1.0 if trig_hit else 0.0)
-    if mode == "llm":
-        return (llm_cat if llm_conf >= float(empathy_cfg.get("min_confidence", 0.55)) else "none", "llm", llm_conf)
-    # hybrid
-    if trig_hit:
-        return (trig_cat, "triggers", 1.0)
-    return (llm_cat if llm_conf >= float(empathy_cfg.get("min_confidence", 0.55)) else "none", "llm", llm_conf)
-
-def build_answer(core_text: str, emotion: str, empathy_bank: Dict[str, dict],
-                 cfg: Dict[str, Any], rng: random.Random | None = None) -> str:
-    if emotion == "none":
-        return core_text
-    rng = rng or random.Random()
-    openers = empathy_bank.get(emotion, {}).get("openers", [])
-    closers = empathy_bank.get(emotion, {}).get("closers", [])
-    parts = []
-    if rng.random() >= float(cfg.get("skip_opener_probability", 0.2)) and openers:
-        parts.append(rng.choice(openers))
-    parts.append(core_text)
-    if len(parts) < int(cfg.get("max_phrases", 2)) + 1 and closers:
-        parts.append(rng.choice(closers))
-    return "\n\n".join(parts)
+def _mark_empathy_used(session: Dict[str, Any], tag: str, phrase: str):
+    session["empathy_last_ts"] = _now()
+    hist = session.setdefault("empathy_recent", [])
+    hist.append((tag, phrase))
+    if len(hist) > 5:
+        hist[:-5] = []  # оставляем последние 5

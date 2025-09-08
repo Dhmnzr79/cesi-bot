@@ -4,6 +4,8 @@ doc_id: "faq-tooth-loss"
 doc_type: "safety"
 topic: "safety"
 verbatim: false
+empathy_enabled: true
+empathy_tag: "fear_pain"
 aliases:
   - "выпал зуб"
   - "что делать если выпал зуб"
