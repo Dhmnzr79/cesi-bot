@@ -98,8 +98,8 @@ def format_candidates_for_log(candidates, top: int = 3):
     # безопасно берём первые top
     seq = list(candidates)[:top]
     for i, c in enumerate(seq, 1):
-        rank  = _field(c, "rank") or i
-        score = _field(c, "score", "rank_score") or 0
+        rank  = int(_field(c, "rank") or i)
+        score = float(_field(c, "score", "rank_score") or 0)
         h2    = _field(c, "h2", "title")
         doc   = _field(c, "doc", "doc_name", "source")
         try:

@@ -16,6 +16,24 @@ from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz
 # from core.empathy import detect_emotion, build_answer  # Функции не используются в новом коде
 
+# --- safe structured_log (never raise) ---
+import logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logger = logging.getLogger("cesi.rag")
+
+try:
+    # если у тебя уже есть модуль с реализацией — используем его
+    from logging_utils import structured_log  # noqa: F401
+except Exception:
+    def structured_log(event: str, **fields):
+        if LOG_LEVEL not in ("DEBUG", "TRACE"):
+            return
+        try:
+            logger.info("%s %s", event, json.dumps(fields, ensure_ascii=False))
+        except Exception:
+            # логирование не должно ломать пайплайн
+            pass
+
 # ==== КОНСТАНТЫ ====
 CONFIG_DIR = Path("config")
 MD_DIR = Path("md")
@@ -108,29 +126,74 @@ except Exception as e:
 # Типы данных
 class Frontmatter:
     def __init__(self, data: Dict[str, Any]):
-        self.id = data.get('id', '')
-        self.slug = data.get('slug', '')
-        self.title = data.get('title', '')
-        self.description = data.get('description', '')
-        self.doc_type = data.get('doc_type', 'info')
-        self.topic = data.get('topic', '')
-        self.tags = data.get('tags', [])
-        self.aliases = data.get('aliases', [])  # ✅ Добавляем aliases
-        self.audience = data.get('audience', '')
-        self.updated = data.get('updated', '')
-        self.locale = data.get('locale', 'ru-RU')
-        self.tone = data.get('tone', 'friendly')
-        self.emotion = data.get('emotion', '')
-        self.criticality = data.get('criticality', 'medium')
-        self.verbatim = data.get('verbatim', False)
-        self.policy_ref = data.get('policy_ref', [])
-        self.source = data.get('source', [])
-        self.preferred_format = data.get('preferred_format', ['short', 'bullets', 'cta'])
-        self.canonical_url = data.get('canonical_url', '')
-        self.noindex = data.get('noindex', False)
-        self.cta_action = data.get('cta_action', '')
-        self.cta_text = data.get('cta_text', '')
-        self.cta_link = data.get('cta_link', '')
+        self._d = dict(data or {})
+        
+        # Устанавливаем стандартные поля как атрибуты
+        self.id = self._d.get('id', '')
+        self.slug = self._d.get('slug', '')
+        self.title = self._d.get('title', '')
+        self.description = self._d.get('description', '')
+        self.doc_type = self._d.get('doc_type', 'info')
+        self.topic = self._d.get('topic', '')
+        self.tags = self._d.get('tags', [])
+        self.aliases = self._d.get('aliases', [])
+        self.audience = self._d.get('audience', '')
+        self.updated = self._d.get('updated', '')
+        self.locale = self._d.get('locale', 'ru-RU')
+        self.tone = self._d.get('tone', 'friendly')
+        self.emotion = self._d.get('emotion', '')
+        self.criticality = self._d.get('criticality', 'medium')
+        self.verbatim = self._d.get('verbatim', False)
+        self.policy_ref = self._d.get('policy_ref', [])
+        self.source = self._d.get('source', [])
+        self.preferred_format = self._d.get('preferred_format', ['short', 'bullets', 'cta'])
+        self.canonical_url = self._d.get('canonical_url', '')
+        self.noindex = self._d.get('noindex', False)
+        self.cta_action = self._d.get('cta_action', '')
+        self.cta_text = self._d.get('cta_text', '')
+        self.cta_link = self._d.get('cta_link', '')
+        
+        # Дополнительные поля для совместимости
+        self.h2_id = self._d.get('h2_id', '')
+        self.h2_title = self._d.get('h2_title', '')
+        self.h3_id = self._d.get('h3_id', '')
+        self.h3_title = self._d.get('h3_title', '')
+        self.h2_aliases = self._d.get('h2_aliases', [])
+        
+        # Устанавливаем все остальные поля как атрибуты
+        for k, v in self._d.items():
+            if not hasattr(self, k):
+                setattr(self, k, v)
+
+    # --- dict-совместимость ---
+    def __getitem__(self, key): 
+        return self._d[key]
+    
+    def __iter__(self): 
+        return iter(self._d)
+    
+    def __len__(self): 
+        return len(self._d)
+    
+    def get(self, key, default=None): 
+        return self._d.get(key, default)
+    
+    def to_dict(self): 
+        return dict(self._d)
+    
+    def keys(self):
+        return self._d.keys()
+    
+    def values(self):
+        return self._d.values()
+    
+    def items(self):
+        return self._d.items()
+    
+    # опционально: обновление/добавление
+    def set(self, key, value):
+        self._d[key] = value
+        setattr(self, key, value)
 
 class RetrievedChunk:
     def __init__(self, id: str, text: str, metadata: Frontmatter, file_name: str):
@@ -258,13 +321,13 @@ def parse_yaml_front_matter(text: str):
         return Frontmatter({}), text
 
 def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]:
-    """Разбивает текст на чанки по секциям (## и ###)"""
+    """Разбивает текст на чанки по секциям (## и ###) с H2/H3 метаданными"""
     chunks = []
     
     # Разрезаем Н2 (## ...)
     h2_blocks = re.split(r'(?m)^\s*##\s+', content)
     
-    for block in h2_blocks:
+    for block_idx, block in enumerate(h2_blocks):
         block = block.strip()
         if not block:
             continue
@@ -282,6 +345,9 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
         if id_match:
             h2_id = id_match.group(1)
             h2_title = re.sub(r'\s*\{#[^}]+\}\s*', '', h2_title).strip()
+        else:
+            # Создаем slug из заголовка если нет явного ID
+            h2_id = slugify(h2_title)
         
         # Ищем алиасы в первой строке после заголовка
         if lines and len(lines) > 1:
@@ -298,21 +364,23 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
             # parts[0] — содержимое до первого ### <- ЭТО НУЖНО СОХРАНИТЬ!
             if h3_blocks[0].strip():
                 preamble_text = f"## {h2_title}\n{h3_blocks[0].strip()}"
-                chunk_id = f"{file_name}#{h2_title}_preamble"
+                chunk_id = f"{file_name}#{h2_id}_preamble"
+                block_id = f"{file_name}#{block_idx:04d}"
                 
-                # Создаем метаданные с H2-алиасами
+                # Создаем метаданные с H2/H3 полями
                 temp_metadata = Frontmatter({
                     "h2_id": h2_id,
                     "h2_title": h2_title,
-                    "h2_aliases": h2_aliases
+                    "h3_id": "",
+                    "h3_title": "",
+                    "aliases": h2_aliases,
+                    "block_id": block_id
                 })
                 
-                # Алиасы только для поиска, не в тексте ответа
-                index_text = preamble_text
-                chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
+                chunks.append(RetrievedChunk(chunk_id, preamble_text.strip(), temp_metadata, file_name))
             
             # дальше создать чанки для каждого ### как сейчас
-            for h3 in h3_blocks[1:]:
+            for h3_idx, h3 in enumerate(h3_blocks[1:], 1):
                 h3 = h3.strip()
                 if not h3:
                     continue
@@ -322,33 +390,37 @@ def chunk_text_by_sections(content: str, file_name: str) -> List[RetrievedChunk]
                 h3_body = '\n'.join(lines[1:])
                 
                 text = f"## {h2_title}\n### {h3_title}\n{h3_body}"
-                chunk_id = f"{file_name}#{h2_title}_{h3_title}"
+                chunk_id = f"{file_name}#{h2_id}_{slugify(h3_title)}"
+                block_id = f"{file_name}#{block_idx:04d}_{h3_idx:04d}"
                 
-                # Создаем метаданные с H2-алиасами
+                # Создаем метаданные с H2/H3 полями
                 temp_metadata = Frontmatter({
                     "h2_id": h2_id,
                     "h2_title": h2_title,
-                    "h2_aliases": h2_aliases
+                    "h3_id": slugify(h3_title),
+                    "h3_title": h3_title,
+                    "aliases": h2_aliases,
+                    "block_id": block_id
                 })
                 
-                # Алиасы только для поиска, не в тексте ответа
-                index_text = text
-                chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
+                chunks.append(RetrievedChunk(chunk_id, text.strip(), temp_metadata, file_name))
         else:
             # Н3 нет - сохраняем Н2 как единый чанк
             text = f"## {h2_title}\n{h2_body}"
-            chunk_id = f"{file_name}#{h2_title}"
+            chunk_id = f"{file_name}#{h2_id}"
+            block_id = f"{file_name}#{block_idx:04d}"
             
-            # Создаем метаданные с H2-алиасами
+            # Создаем метаданные с H2/H3 полями
             temp_metadata = Frontmatter({
                 "h2_id": h2_id,
                 "h2_title": h2_title,
-                "h2_aliases": h2_aliases
+                "h3_id": "",
+                "h3_title": "",
+                "aliases": h2_aliases,
+                "block_id": block_id
             })
             
-            # Алиасы только для поиска, не в тексте ответа
-            index_text = text
-            chunks.append(RetrievedChunk(chunk_id, index_text.strip(), temp_metadata, file_name))
+            chunks.append(RetrievedChunk(chunk_id, text.strip(), temp_metadata, file_name))
     
     return chunks
 
@@ -746,9 +818,12 @@ try:
                             "section": name
                         }
             
-            # Привязываем метаданные к каждому чанку
+            # Привязываем метаданные к каждому чанку (merge: поля чанка важнее полей файла)
             for chunk in file_chunks:
-                chunk.metadata = metadata
+                file_meta = metadata.__dict__ if hasattr(metadata, "__dict__") else {}
+                chunk_meta = chunk.metadata.__dict__ if hasattr(chunk.metadata, "__dict__") else {}
+                merged = {**file_meta, **chunk_meta}  # H2/H3/aliases из чанка НЕ теряем
+                chunk.metadata = Frontmatter(merged)
                 
                 # Обновляем ENTITY_INDEX для всех чанков
                 if metadata.topic:
@@ -800,7 +875,7 @@ try:
             continue
     
     # Логируем статистику фильтрации
-    log_m.info(json.dumps({"ev":"filter_index_like","skipped":skipped,"total":len(all_md_files)}, ensure_ascii=False))
+    log_m.info({"ev":"filter_index_like","skipped":skipped,"total":len(all_md_files)})
     
     print(f"\u23f3 Найдено {len(all_chunks)} чанков")
     
@@ -819,8 +894,11 @@ try:
         print(f"🔍 Создаем BM25 индекс для {len(ALL_CHUNKS)} чанков...")
         bm25_corpus = []
         for chunk in ALL_CHUNKS:
-            # Токенизируем текст + алиасы для BM25
-            alias_boost = " ".join(getattr(chunk.metadata, 'h2_aliases', ()) or [])
+            # Токенизируем текст + реальные алиасы для BM25
+            boost_aliases = extract_aliases_from_chunk(chunk.text)
+            if getattr(chunk.metadata, "aliases", None):
+                boost_aliases += list(chunk.metadata.aliases)
+            alias_boost = " ".join(boost_aliases)
             tokens = re.findall(r'\w+', (chunk.text + " " + alias_boost).lower())
             bm25_corpus.append(tokens)
         
@@ -840,7 +918,7 @@ try:
         print("⚠️ Предупреждение: Не найдено ни одного чанка для обработки")
         # Создаем пустой индекс
         dimension = 1536  # размерность text-embedding-3-small
-        index = faiss.IndexFlatL2(dimension)
+        index = IndexFlatIP(dimension)
     else:
         # Получаем эмбеддинги для всех фрагментов
         print(f"\u23f3 Генерация эмбеддингов для {len(all_chunks)} чанков...")
@@ -856,10 +934,13 @@ try:
         # Делаем функцию глобально доступной
         globals()['get_embedding'] = get_embedding
         
-        # Создаем эмбеддинги: текст + алиасы для поиска
+        # Создаем эмбеддинги: текст + реальные алиасы для поиска
         chunk_texts = []
         for chunk in ALL_CHUNKS:
-            alias_boost = " ".join(getattr(chunk.metadata, 'h2_aliases', ()) or [])
+            boost_aliases = extract_aliases_from_chunk(chunk.text)
+            if getattr(chunk.metadata, "aliases", None):
+                boost_aliases += list(chunk.metadata.aliases)
+            alias_boost = " ".join(boost_aliases)
             chunk_texts.append((chunk.text + " " + alias_boost).strip())
         embeddings = [get_embedding(text) for text in chunk_texts]
         
@@ -873,7 +954,7 @@ try:
         
         # Логируем backend при старте
         from core.logger import log_m
-        log_m.info(json.dumps({"event": "faiss_backend", "value": "faiss" if HAS_FAISS else "numpy"}, ensure_ascii=False))
+        log_m.info({"event": "faiss_backend", "value": "faiss" if HAS_FAISS else "numpy"})
 
 except Exception as e:
     print(f"❌ Критическая ошибка при инициализации: {e}")
@@ -947,6 +1028,205 @@ def generate_query_variants(query: str) -> List[str]:
         print(f"❌ Ошибка генерации вариантов запроса: {e}")
         return [query]  # Fallback к исходному запросу
 
+# ==== УТИЛИТЫ ГИБРИДНОГО РЕТРИВЕРА ====
+def _minmax(xs):
+    """Находит min и max в списке"""
+    if not xs:
+        return 0.0, 1.0
+    return min(xs), max(xs)
+
+def _norm_score(x, lo, hi):
+    """Нормирует score в диапазон [0, 1]"""
+    if hi == lo:
+        return 0.5
+    return (x - lo) / (hi - lo)
+
+def _boost_by_doctype(item):
+    """Добавляет буст по типу документа"""
+    boost = 0.0
+    doc_type = getattr(item.metadata, 'doc_type', '') if hasattr(item, 'metadata') else ''
+    file_name = getattr(item, 'file_name', '') or ''
+    
+    # Буст для контактов
+    if 'contacts' in doc_type or 'contacts' in file_name:
+        boost += float(os.getenv('BOOST_CONTACTS', '0.10'))
+    
+    # Буст для цен
+    if any(x in doc_type for x in ['prices', 'price']) or any(x in file_name for x in ['prices', 'price']):
+        boost += float(os.getenv('BOOST_PRICES', '0.08'))
+    
+    return boost
+
+def _len_penalty(item):
+    """Штраф за очень длинные куски"""
+    text = getattr(item, 'text', '') or ''
+    # Примерная оценка токенов (1 токен ≈ 4 символа)
+    len_tokens = len(text) / 4
+    penalty = float(os.getenv('LEN_PENALTY', '0.05')) * (len_tokens / 1000)
+    return penalty
+
+def rrf_score(rank: int, k: int = 60) -> float:
+    """Вычисляет RRF score для ранга"""
+    return 1.0 / (k + rank)
+
+def rrf_fusion(emb_hits, bm25_hits, k: int = 8) -> List[RetrievedChunk]:
+    """RRF fusion для объединения результатов embed и BM25 поиска"""
+    rrf_k = int(os.getenv('RRF_K', '60'))
+    
+    # Создаем словарь для RRF scores
+    rrf_scores = {}
+    
+    # Добавляем embed результаты с рангами
+    for rank, (chunk, score) in enumerate(emb_hits, 1):
+        h2_id = getattr(chunk.metadata, 'h2_id', '') if hasattr(chunk, 'metadata') else ''
+        h3_id = getattr(chunk.metadata, 'h3_id', '') if hasattr(chunk, 'metadata') else ''
+        block_id = getattr(chunk.metadata, 'block_id', '') if hasattr(chunk, 'metadata') else ''
+        
+        key = (chunk.file_name, h2_id, h3_id or block_id)
+        if key not in rrf_scores:
+            rrf_scores[key] = {'chunk': chunk, 'rrf_emb': 0.0, 'rrf_bm25': 0.0, 'total_rrf': 0.0}
+        rrf_scores[key]['rrf_emb'] = rrf_score(rank, rrf_k)
+    
+    # Добавляем BM25 результаты с рангами
+    for rank, (chunk, score) in enumerate(bm25_hits, 1):
+        h2_id = getattr(chunk.metadata, 'h2_id', '') if hasattr(chunk, 'metadata') else ''
+        h3_id = getattr(chunk.metadata, 'h3_id', '') if hasattr(chunk, 'metadata') else ''
+        block_id = getattr(chunk.metadata, 'block_id', '') if hasattr(chunk, 'metadata') else ''
+        
+        key = (chunk.file_name, h2_id, h3_id or block_id)
+        if key not in rrf_scores:
+            rrf_scores[key] = {'chunk': chunk, 'rrf_emb': 0.0, 'rrf_bm25': 0.0, 'total_rrf': 0.0}
+        rrf_scores[key]['rrf_bm25'] = rrf_score(rank, rrf_k)
+    
+    # Вычисляем общий RRF score
+    candidates = []
+    for key, data in rrf_scores.items():
+        chunk = data['chunk']
+        rrf_emb = data['rrf_emb']
+        rrf_bm25 = data['rrf_bm25']
+        total_rrf = rrf_emb + rrf_bm25
+        
+        # Устанавливаем атрибуты для логирования
+        chunk.rrf_emb = rrf_emb
+        chunk.rrf_bm25 = rrf_bm25
+        chunk.total_rrf = total_rrf
+        
+        candidates.append(chunk)
+    
+    # Сортируем по общему RRF score и возвращаем top-k
+    candidates.sort(key=lambda x: x.total_rrf, reverse=True)
+    return candidates[:k]
+
+def hybrid_merge(emb_hits, bm25_hits, k, w_emb, w_bm25):
+    """Сливает результаты embed и BM25 поиска с ключами по H3/блоку"""
+    # Нормируем scores в [0, 1]
+    emb_scores = [score for _, score in emb_hits] if emb_hits else [0.0]
+    bm25_scores = [score for _, score in bm25_hits] if bm25_hits else [0.0]
+    
+    emb_lo, emb_hi = _minmax(emb_scores)
+    bm25_lo, bm25_hi = _minmax(bm25_scores)
+    
+    # Создаем словарь для слияния по ключу (file, h2_id, h3_id|block_id)
+    merged = {}
+    
+    # Добавляем embed результаты
+    for chunk, score in emb_hits:
+        h2_id = getattr(chunk.metadata, 'h2_id', '') if hasattr(chunk, 'metadata') else ''
+        h3_id = getattr(chunk.metadata, 'h3_id', '') if hasattr(chunk, 'metadata') else ''
+        block_id = getattr(chunk.metadata, 'block_id', '') if hasattr(chunk, 'metadata') else ''
+        
+        # Ключ: (file_name, h2_id, h3_id|block_id)
+        key = (chunk.file_name, h2_id, h3_id or block_id)
+        norm_score = _norm_score(score, emb_lo, emb_hi)
+        merged[key] = {
+            'chunk': chunk,
+            'emb': norm_score,
+            'bm25': 0.0,
+            'hybrid': 0.0
+        }
+    
+    # Добавляем BM25 результаты
+    for chunk, score in bm25_hits:
+        h2_id = getattr(chunk.metadata, 'h2_id', '') if hasattr(chunk, 'metadata') else ''
+        h3_id = getattr(chunk.metadata, 'h3_id', '') if hasattr(chunk, 'metadata') else ''
+        block_id = getattr(chunk.metadata, 'block_id', '') if hasattr(chunk, 'metadata') else ''
+        
+        # Ключ: (file_name, h2_id, h3_id|block_id)
+        key = (chunk.file_name, h2_id, h3_id or block_id)
+        norm_score = _norm_score(score, bm25_lo, bm25_hi)
+        if key in merged:
+            merged[key]['bm25'] = norm_score
+        else:
+            merged[key] = {
+                'chunk': chunk,
+                'emb': 0.0,
+                'bm25': norm_score,
+                'hybrid': 0.0
+            }
+    
+    # Вычисляем финальный hybrid score
+    candidates = []
+    for key, data in merged.items():
+        chunk = data['chunk']
+        emb_score = data['emb']
+        bm25_score = data['bm25']
+        
+        # Комбинированный score
+        hybrid_score = w_emb * emb_score + w_bm25 * bm25_score
+        
+        # Добавляем бусты и штрафы
+        hybrid_score += _boost_by_doctype(chunk)
+        hybrid_score -= _len_penalty(chunk)
+        
+        # Устанавливаем атрибуты для логирования
+        chunk.emb = emb_score
+        chunk.bm25 = bm25_score
+        chunk.hybrid = hybrid_score
+        
+        candidates.append(chunk)
+    
+    # Сортируем по hybrid score и возвращаем top-k
+    candidates.sort(key=lambda x: x.hybrid, reverse=True)
+    return candidates[:k]
+
+def embed_search(query, top=6):
+    """Поиск по эмбеддингам"""
+    if not index or not all_chunks:
+        return []
+    
+    try:
+        query_embedding = get_embedding(query)
+        q = np.asarray([query_embedding], dtype="float32")
+        normalize_L2_inplace(q)
+        D, I = index.search(q, min(top, len(all_chunks)))
+        
+        results = []
+        for i, sim in zip(I[0], D[0]):
+            # Для IndexFlatIP D возвращает сходство (больше — лучше)
+            results.append((all_chunks[i], float(sim)))
+        
+        return results
+    except Exception as e:
+        print(f"Ошибка в embed поиске: {e}")
+        return []
+
+def bm25_search(query, top=8):
+    """Поиск по BM25"""
+    if not bm25_index or not all_chunks:
+        return []
+    
+    query_tokens = re.findall(r'\w+', query.lower())
+    bm25_scores = bm25_index.get_scores(query_tokens)
+    
+    results = []
+    for i, score in enumerate(bm25_scores):
+        if score > 0:
+            results.append((all_chunks[i], score))
+    
+    # Сортируем по score и берем top
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:top]
+
 def hybrid_retriever(query: str, top_n: int = 20) -> List[Tuple[RetrievedChunk, float]]:
     """Гибридный ретривер: объединяет BM25 и эмбеддинги"""
     if not all_chunks or len(all_chunks) == 0:
@@ -978,12 +1258,12 @@ def hybrid_retriever(query: str, top_n: int = 20) -> List[Tuple[RetrievedChunk, 
         normalize_L2_inplace(q)
         D, I = index.search(q, min(top_n, len(all_chunks)))
         
-        # Нормализуем embedding scores
-        max_dist = max(D[0]) if len(D[0]) > 0 else 1.0
-        if max_dist > 0:
+        # Нормализуем embedding scores для IP (max = лучший)
+        max_ip = max(D[0]) if len(D[0]) > 0 else 1.0
+        if max_ip > 0:
             embedding_candidates = []
-            for i, dist in zip(I[0], D[0]):
-                score = (1.0 - dist / max_dist) * 0.4  # Нормализуем и применяем вес
+            for i, sim in zip(I[0], D[0]):
+                score = (sim / max_ip) * 0.4  # чем больше IP, тем выше скор
                 embedding_candidates.append((all_chunks[i], score))
             candidates.extend(embedding_candidates)
     except Exception as e:
@@ -1002,65 +1282,153 @@ def hybrid_retriever(query: str, top_n: int = 20) -> List[Tuple[RetrievedChunk, 
     unique_candidates.sort(key=lambda x: x[1], reverse=True)
     return unique_candidates[:top_n]
 
-def llm_rerank(candidates: List[Tuple[RetrievedChunk, float]], query: str) -> List[Tuple[RetrievedChunk, float]]:
-    """LLM-реранкинг для точной оценки релевантности чанков"""
-    if not candidates or not openai_client:
-        return candidates
-    
-    # Берем только top-6 кандидатов для реранкинга
-    top_candidates = candidates[:6]
-    
-    # Формируем промпт для LLM
-    chunks_text = ""
-    for i, (chunk, score) in enumerate(top_candidates):
-        # Берем только заголовок и первые 200 символов для экономии токенов
-        header_match = re.search(r'(?m)^##\s+(.+?)\s*$', chunk.text)
-        header = header_match.group(1) if header_match else "Без заголовка"
-        preview = chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text
-        chunks_text += f"{i+1}. Заголовок: {header}\nТекст: {preview}\n\n"
-    
-    prompt = f"""Оцени релевантность каждого фрагмента для ответа на вопрос пользователя.
+# --- safe structured_log (never raise) ---
+import logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logger = logging.getLogger("cesi.rag")
 
-Вопрос: "{query}"
+try:
+    # если у тебя уже есть модуль с реализацией — используем его
+    from logging_utils import structured_log  # noqa: F401
+except Exception:
+    def structured_log(event: str, **fields):
+        if LOG_LEVEL not in ("DEBUG", "TRACE"):
+            return
+        try:
+            logger.info("%s %s", event, json.dumps(fields, ensure_ascii=False))
+        except Exception:
+            # логирование не должно ломать пайплайн
+            pass
 
-Фрагменты:
-{chunks_text}
+# --- safe JSON parser ---
+def _extract_json_block(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lstrip("\ufeff").strip()
+    # вытащить блок из ```json ... ```
+    m = re.search(r"```json(.*?)```", s, flags=re.S|re.I)
+    if m:
+        return m.group(1).strip()
+    # иначе взять от первого '{' до последней '}'
+    i, j = s.find("{"), s.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        return s[i:j+1]
+    return s
 
-Верни ТОЛЬКО JSON с оценками от 0.0 до 1.0:
-{{"scores": [0.8, 0.3, 0.9, 0.1, 0.7, 0.2]}}
-
-Где 1.0 = максимально релевантно, 0.0 = не релевантно."""
-    
+def _parse_rerank_json(raw: str, expected_n: int):
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
-            temperature=0.1
+        raw = _extract_json_block(raw)
+        data = json.loads(raw)
+    except Exception:
+        return None  # сигнал «невалидно»
+
+    # ожидаем формат: {"scores":[{"id":"...", "score":0.73}, ...]}
+    scores = data.get("scores") if isinstance(data, dict) else None
+    if not isinstance(scores, list) or not scores:
+        return None
+
+    out = {}
+    for item in scores:
+        if not isinstance(item, dict): 
+            return None
+        _id = item.get("id")
+        sc  = item.get("score")
+        if not isinstance(_id, str):
+            return None
+        try:
+            sc = float(sc)
+        except Exception:
+            return None
+        # привести к диапазону [0,1]
+        sc = max(0.0, min(1.0, sc))
+        out[_id] = sc
+
+    # длина может не совпасть — допустим частичную, но не пустую
+    if len(out) == 0:
+        return None
+    return out  # dict{id->score}
+
+# --- safe rerank with fallback ---
+RERANK_MODEL = os.getenv("RERANK_MODEL", "gpt-4o-mini")
+RERANK_TIMEOUT = int(os.getenv("RERANK_TIMEOUT", "10"))
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "320"))
+_rerank_fail_streak = 0
+RERANK_CIRCUIT_MAX_FAILS = int(os.getenv("RERANK_CIRCUIT_MAX_FAILS", "3"))
+
+def llm_rerank(candidates: List[Tuple[RetrievedChunk, float]], query: str) -> List[Tuple[RetrievedChunk, float]]:
+    """
+    candidates: list[Chunk]; у каждого есть .id, .text, .metadata
+    Возвращает list[(chunk, score)] по убыванию score.
+    """
+    global _rerank_fail_streak
+    n = len(candidates)
+    if n <= 1:
+        return [(c, 1.0) for c in candidates]
+
+    # circuit breaker: если подряд много фейлов — не дергаем LLM
+    if _rerank_fail_streak >= RERANK_CIRCUIT_MAX_FAILS:
+        # базовое (до реранка) сортирование уже есть — просто вернём его
+        return [(c, getattr(c, "hybrid", 0.5)) for c in candidates]
+
+    # подготовим компактные элементы (чтоб не упереться в токены)
+    items = []
+    for c in candidates:
+        h2 = (c.metadata.get("h2_title") or c.metadata.get("h2_id") or "")[:80]
+        h3 = (c.metadata.get("h3_title") or c.metadata.get("h3_id") or "")[:80]
+        sn = (c.text or "")[:RERANK_MAX_CHARS]
+        items.append({"id": c.id, "h2": h2, "h3": h3, "snippet": sn})
+
+    system = (
+        "You are a ranking function. "
+        "Score each item for answering the query. "
+        "Return STRICT JSON only, no prose."
+    )
+    user = {
+        "query": query,
+        "instruction": (
+            "For each item assign a relevance score between 0 and 1. "
+            f"Return JSON: {{\"scores\":[{{\"id\":\"...\",\"score\":0.xx}}]}} "
+            f"with up to {n} items. No text outside JSON."
+        ),
+        "items": items
+    }
+
+    try:
+        # ВАЖНО: без стрима и с json-форматом
+        resp = openai_client.chat.completions.create(
+            model=RERANK_MODEL,
+            temperature=0,
+            top_p=0,
+            response_format={"type": "json_object"},
+            timeout=RERANK_TIMEOUT,
+            messages=[
+                {"role":"system","content":system},
+                {"role":"user","content":json.dumps(user, ensure_ascii=False)}
+            ],
         )
-        
-        result = json.loads(response.choices[0].message.content)
-        llm_scores = result.get("scores", [])
-        
-        # Применяем LLM-оценки к кандидатам
-        reranked = []
-        for i, (chunk, base_score) in enumerate(top_candidates):
-            if i < len(llm_scores):
-                # Комбинируем базовый score с LLM-оценкой (70% LLM, 30% базовый)
-                final_score = llm_scores[i] * 0.7 + base_score * 0.3
-                reranked.append((chunk, final_score))
-            else:
-                reranked.append((chunk, base_score))
-        
-        # Сортируем по финальному score
-        reranked.sort(key=lambda x: x[1], reverse=True)
-        print(f"🔍 LLM-реранкинг: {len(reranked)} кандидатов переоценены")
-        
-        return reranked
-        
+        raw = resp.choices[0].message.content or ""
+        mapping = _parse_rerank_json(raw, n)
+        if mapping is None:
+            raise ValueError("invalid_json")
+
+        # применяем к кандидатам; если какого-то id нет — даём базовый вес
+        out = []
+        for c in candidates:
+            sc = mapping.get(c.id, getattr(c, "hybrid", 0.5))
+            out.append((c, float(sc)))
+        out.sort(key=lambda x: x[1], reverse=True)
+        _rerank_fail_streak = 0
+        return out
+
     except Exception as e:
-        print(f"❌ Ошибка LLM-реранкинга: {e}")
-        return candidates
+        _rerank_fail_streak += 1
+        # ЛОГ, но без падения пайплайна
+        try:
+            structured_log("rerank.error", reason=str(e), streak=_rerank_fail_streak)
+        except Exception:
+            pass
+        # Фолбэк: базовая сортировка (hybrid/RRF score уже на кандидатах есть)
+        return [(c, getattr(c, "hybrid", 0.5)) for c in candidates]
 
 def select_chunk_by_alias(chunks: List[RetrievedChunk], query: str) -> RetrievedChunk | None:
     """Форс-матч по алиасам перед финальным выбором чанка"""
@@ -1074,39 +1442,67 @@ def select_chunk_by_alias(chunks: List[RetrievedChunk], query: str) -> Retrieved
     return None
 
 def reranker(candidates: List[Tuple[RetrievedChunk, float]], query: str, detected_topics: Set[str]) -> List[RetrievedChunk]:
-    """Реранкер с LLM-оценкой релевантности"""
+    """Реранкер с LLM-оценкой релевантности для HYBRID_TIGHT режима"""
     if not candidates:
         return []
     
-    # Сначала применяем LLM-реранкинг
-    llm_reranked = llm_rerank(candidates, query)
+    rag_mode = os.getenv('RAG_MODE', 'PRECISE_SIMPLE')
+    rerank_enable = os.getenv('RERANK_ENABLE', 'false').lower() == 'true'
     
-    # Затем применяем эвристические бонусы
-    scored_candidates = []
-    query_lower = query.lower()
+    # В PRECISE_SIMPLE режиме реранк отключен
+    if rag_mode == 'PRECISE_SIMPLE' or not rerank_enable:
+        # Простая сортировка по score
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return [chunk for chunk, _ in candidates[:3]]
     
-    for chunk, base_score in llm_reranked:
-        final_score = base_score
+    # В HYBRID_TIGHT режиме применяем LLM-реранкинг
+    if rag_mode == 'HYBRID_TIGHT':
+        # Берем больше кандидатов для реранкинга
+        top_candidates = [chunk for chunk, _ in candidates[:6]]  # минимум 6-8 кандидатов
+        llm_reranked = llm_rerank(top_candidates, query)
         
-        # +0.2 если тема от router совпала с темой чанка
-        if detected_topics and chunk.metadata.topic:
-            if chunk.metadata.topic in detected_topics:
-                final_score += 0.2
+        # Затем применяем эвристические бонусы
+        scored_candidates = []
+        query_lower = query.lower()
         
-        # +0.1 если найден alias через ENTITY_INDEX
-        for alias, meta in ENTITY_INDEX.items():
-            if alias in query_lower:
-                if meta["doc_id"] == chunk.file_name:
-                    final_score += 0.1
-                    break
+        for chunk, base_score in llm_reranked:
+            final_score = base_score
+            
+            # +0.2 если тема от router совпала с темой чанка
+            if detected_topics and chunk.metadata.topic:
+                if chunk.metadata.topic in detected_topics:
+                    final_score += 0.2
+            
+            # +0.1 если найден alias через ENTITY_INDEX
+            for alias, meta in ENTITY_INDEX.items():
+                if alias in query_lower:
+                    if meta["doc_id"] == chunk.file_name:
+                        final_score += 0.1
+                        break
+            
+            scored_candidates.append((chunk, final_score))
         
-        scored_candidates.append((chunk, final_score))
+        # Применяем штраф длины на финальной сортировке
+        len_penalty = float(os.getenv('LEN_PENALTY', '0.03'))
+        final_candidates = []
+        for chunk, score in scored_candidates:
+            # Штраф за длину
+            text = getattr(chunk, 'text', '') or ''
+            len_tokens = len(text) / 4  # Примерная оценка токенов
+            penalty = len_penalty * (len_tokens / 1000)
+            final_score = score - penalty
+            final_candidates.append((chunk, final_score))
+        
+        # Сортируем по финальному score
+        final_candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Возвращаем top-RERANK_TOP_R чанков
+        rerank_top_r = int(os.getenv('RERANK_TOP_R', '3'))
+        return [chunk for chunk, _ in final_candidates[:rerank_top_r]]
     
-    # Сортируем по финальному score
-    scored_candidates.sort(key=lambda x: x[1], reverse=True)
-    
-    # Возвращаем 2-3 лучших чанка
-    return [chunk for chunk, _ in scored_candidates[:3]]
+    # Fallback для других режимов
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return [chunk for chunk, _ in candidates[:3]]
 
 
 
@@ -1302,16 +1698,119 @@ def retrieve_relevant_chunks(query: str, top_k: int = None) -> List[RetrievedChu
     try:
         print(f"🔍 Поиск: '{query}' в {len(all_chunks)} чанках")
         
-        # ==== MULTI-QUERY REWRITE ====
-        query_variants = generate_query_variants(query)
-        print(f"🔍 Multi-query: используем {len(query_variants)} вариантов запроса")
+        # ==== УСЛОВНЫЙ MULTI-QUERY ====
+        mq_enable   = os.getenv('MQ_ENABLE_CONDITIONAL','true').lower() == 'true'
+        mq_minwords = int(os.getenv('MQ_MIN_WORDS','5'))
+        mq_maxvars  = int(os.getenv('MQ_MAX_VARIANTS','2'))
+        mq_budget   = int(os.getenv('MQ_MAX_CANDIDATES','8'))
+        mq_exclude_patterns = os.getenv('MQ_EXCLUDE_PATTERNS','больно|страшно|адрес|как добраться')
+
+        words = re.findall(r'\w+', query, flags=re.U)
+        
+        # Проверяем исключающие паттерны
+        exclude_mq = False
+        if mq_exclude_patterns:
+            exclude_patterns = mq_exclude_patterns.split('|')
+            query_lower = query.lower()
+            for pattern in exclude_patterns:
+                if pattern.strip() in query_lower:
+                    exclude_mq = True
+                    print(f"🔍 MQ исключен по паттерну: '{pattern}'")
+                    break
+        
+        use_mq = mq_enable and (len(words) >= mq_minwords) and not exclude_mq
+        query_variants = [query] if not use_mq else generate_query_variants(user_message)[:mq_maxvars]
+        print(f"🔍 Multi-query: используем {len(query_variants)} вариантов (условно: {use_mq}, слов: {len(words)})")
+        
+        # Логируем MQ использование
+        try:
+            structured_log["mq_used"] = use_mq
+        except Exception:
+            pass
         
         # ==== ГИБРИДНЫЙ РЕТРИВЕР ДЛЯ КАЖДОГО ВАРИАНТА ====
         all_candidates = []
+        rag_mode = os.getenv('RAG_MODE', 'PRECISE_SIMPLE')
+        
         for variant in query_variants:
-            candidates = hybrid_retriever(variant, top_n=15)  # Меньше кандидатов на вариант
-            all_candidates.extend(candidates)
-            print(f"🔍 Вариант '{variant[:30]}...': найдено {len(candidates)} кандидатов")
+            if rag_mode == 'HYBRID_TIGHT' and os.getenv('HYBRID_ENABLE', 'true').lower() == 'true':
+                # HYBRID_TIGHT режим с RRF fusion
+                topk_emb = int(os.getenv('HYBRID_TOPK_EMB', '6'))
+                topk_bm25 = int(os.getenv('HYBRID_TOPK_BM25', '6'))
+                k = int(os.getenv('HYBRID_K', '8'))
+                fusion_method = os.getenv('FUSION_METHOD', 'RRF')
+                
+                # Выполняем раздельный поиск
+                emb_hits = embed_search(variant, top=topk_emb)
+                bm25_hits = bm25_search(variant, top=topk_bm25)
+                
+                # Логируем пул кандидатов
+                from core.logger import log_m
+                log_m.info({
+                    "ev": "hybrid_pool",
+                    "emb_n": len(emb_hits),
+                    "bm25_n": len(bm25_hits),
+                    "fusion_method": fusion_method
+                })
+                
+                # Выбираем метод fusion
+                if fusion_method == 'RRF':
+                    candidates = rrf_fusion(emb_hits, bm25_hits, k)
+                else:
+                    # Fallback к старому методу
+                    w_emb = float(os.getenv('HYBRID_W_EMB', '0.60'))
+                    w_bm25 = float(os.getenv('HYBRID_W_BM25', '0.40'))
+                    candidates = hybrid_merge(emb_hits, bm25_hits, k, w_emb, w_bm25)
+                
+                # Логируем топ кандидатов
+                log_m.info({
+                    "ev": "hybrid_top",
+                    "cands": [
+                        {
+                            "doc": getattr(c, "file_name", None),
+                            "h2": getattr(c.metadata, "h2_id", None) if hasattr(c, "metadata") else None,
+                            "h3": getattr(c.metadata, "h3_id", None) if hasattr(c, "metadata") else None,
+                            "rrf_emb": float(getattr(c, "rrf_emb", 0.0)),
+                            "rrf_bm25": float(getattr(c, "rrf_bm25", 0.0)),
+                            "total_rrf": float(getattr(c, "total_rrf", 0.0))
+                        } for c in candidates
+                    ]
+                })
+                
+                # Добавляем в структурированный лог
+                try:
+                    structured_log["candidates_before"].extend([
+                        {
+                            "id": getattr(c, "id", ""),
+                            "file": getattr(c, "file_name", ""),
+                            "h2": getattr(c.metadata, "h2_id", "") if hasattr(c, "metadata") else "",
+                            "h3": getattr(c.metadata, "h3_id", "") if hasattr(c, "metadata") else "",
+                            "src": "emb" if fusion_method == "RRF" else "hybrid",
+                            "rank": i+1,
+                            "score": float(getattr(c, "total_rrf", 0.0))
+                        } for i, c in enumerate(candidates)
+                    ])
+                    
+                    structured_log["fusion"].extend([
+                        {
+                            "id": getattr(c, "id", ""),
+                            "rrf": float(getattr(c, "total_rrf", 0.0))
+                        } for c in candidates
+                    ])
+                except Exception:
+                    pass
+                
+                # Конвертируем в формат (chunk, score) для совместимости
+                candidates_with_scores = [(c, getattr(c, 'total_rrf', 0.0)) for c in candidates]
+                all_candidates.extend(candidates_with_scores)
+            else:
+                # PRECISE_SIMPLE режим - только embed поиск
+                top_k = int(os.getenv('EMB_TOPK', '4'))
+                emb_hits = embed_search(variant, top=top_k)
+                candidates_with_scores = [(c, score) for c, score in emb_hits]
+                all_candidates.extend(candidates_with_scores)
+            
+            print(f"🔍 Вариант '{variant[:30]}...': найдено {len(candidates_with_scores)} кандидатов")
         
         # ==== ОБЪЕДИНЕНИЕ И ДЕДУПЛИКАЦИЯ ====
         seen_chunks = set()
@@ -1324,19 +1823,70 @@ def retrieve_relevant_chunks(query: str, top_k: int = None) -> List[RetrievedChu
         
         # Сортируем по score и берем top
         unique_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = unique_candidates[:25]  # Больше кандидатов для реранкинга
+        # бюджет на первый проход
+        top_candidates = unique_candidates[:mq_budget] if mq_budget > 0 else unique_candidates[:25]
         
         print(f"🔍 Multi-query: объединено {len(unique_candidates)} уникальных кандидатов")
         
+        # ==== ДЕДУП ПО H2/H3 И ПО ФАЙЛУ ====
+        uniq = {}
+        for chunk, score in top_candidates:
+            h2_id = getattr(chunk.metadata, "h2_id", "") if hasattr(chunk, "metadata") else ""
+            h3_id = getattr(chunk.metadata, "h3_id", "") if hasattr(chunk, "metadata") else ""
+            block_id = getattr(chunk.metadata, "block_id", "") if hasattr(chunk, "metadata") else ""
+            key = (chunk.file_name, h2_id, h3_id or block_id)
+            if key not in uniq:
+                uniq[key] = (chunk, score)
+        candidates = list(uniq.values())
+        
+        # ==== ТЕМАТИЧЕСКАЯ КОГЕРЕНТНОСТЬ (МЯГКИЙ БУСТ) ====
+        if candidates:
+            anchor = candidates[0][0]
+            anchor_topic = (getattr(anchor, "metadata", None) or {}).topic or ""
+            anchor_file = getattr(anchor, "file_name", "")
+            anchor_h2 = getattr(anchor.metadata, "h2_id", "") if hasattr(anchor, "metadata") else ""
+            
+            # Применяем мягкий буст вместо фильтра
+            boosted_candidates = []
+            for chunk, score in candidates:
+                final_score = score
+                
+                # Буст за когерентность
+                same_file = chunk.file_name == anchor_file
+                same_topic = getattr(getattr(chunk, "metadata", None), "topic", "") == anchor_topic
+                same_h2 = getattr(chunk.metadata, "h2_id", "") == anchor_h2 if hasattr(chunk, "metadata") else False
+                
+                if same_file or same_h2:
+                    final_score += 0.08  # НЕ фильтровать, а бустить!
+                elif same_topic:
+                    final_score += 0.04
+                
+                boosted_candidates.append((chunk, final_score))
+            
+            # Сортируем по финальному score
+            boosted_candidates.sort(key=lambda x: x[1], reverse=True)
+            candidates = boosted_candidates[:3]
+        
         # ==== ФОРС-МАТЧ ПО АЛИАСАМ ====
-        forced_chunk = select_chunk_by_alias([chunk for chunk, _ in top_candidates], query)
+        forced_chunk = select_chunk_by_alias([chunk for chunk, _ in candidates], query)
         if forced_chunk:
             print(f"🎯 Форс-матч по алиасу: {forced_chunk.id}")
             final_chunks = [forced_chunk]
         else:
             # ==== РЕРАНКЕР ====
-            final_chunks = reranker(top_candidates, query, detected_topics)
+            final_chunks = reranker(candidates, query, detected_topics)
             print(f"🔍 Реранкер отобрал {len(final_chunks)} финальных чанков")
+            
+            # Логируем реранк
+            try:
+                structured_log["rerank"] = [
+                    {
+                        "id": getattr(c, "id", ""),
+                        "score": float(getattr(c, "score", 0.0))
+                    } for c in final_chunks
+                ]
+            except Exception:
+                pass
         
         # если ничего внятного не попало и тема известна — жёсткий fallback
         if not final_chunks and detected_topics:
@@ -1356,6 +1906,18 @@ def retrieve_relevant_chunks(query: str, top_k: int = None) -> List[RetrievedChu
                 out.append(chunk)
         
         print(f"✅ Возвращаем {len(out)} уникальных чанков")
+        
+        # Логируем финальный контекст
+        try:
+            structured_log["final_ctx"] = [
+                {
+                    "id": getattr(c, "id", ""),
+                    "score": float(getattr(c, "score", 0.0))
+                } for c in out[:top_k]
+            ]
+        except Exception:
+            pass
+        
         return out[:top_k]
         
     except Exception as e:
@@ -1396,7 +1958,7 @@ def synthesize_answer(chunks: List[RetrievedChunk], user_query: str, verbatim=Fa
         prepared_chunks.append(prepared)
         prepared_len += len(prepared)
     
-    log_m.info(json.dumps({"ev":"prepared_context","count":len(prepared_chunks),"prepared_len":prepared_len,"verbatim":verbatim_used}, ensure_ascii=False))
+    log_m.info({"ev":"prepared_context","count":len(prepared_chunks),"prepared_len":prepared_len,"verbatim":verbatim_used})
     
     # Используем подготовленные чанки вместо сырых текстов
     if verbatim or not prepared_chunks:
@@ -1471,7 +2033,7 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
     context = "\n---\n".join(context_parts)
     
     # Логируем статистику очистки
-    log_m.info(json.dumps({"ev":"clean_section","orig_len":total_before,"clean_len":total_after,"reduced":total_before-total_after}, ensure_ascii=False))
+    log_m.info({"ev":"clean_section","orig_len":total_before,"clean_len":total_after,"reduced":total_before-total_after})
     print(f"📝 Контекст для синтеза: {len(context)} символов")
     print(f"📝 Первые 200 символов контекста: {context[:200]}...")
     
@@ -1577,7 +2139,7 @@ def synthesize_answer_old(chunks: List[RetrievedChunk], user_query: str, allow_c
         # Логируем финиш модели
         finish = completion.choices[0].finish_reason  # "stop" | "length" | ...
         c_tokens = getattr(completion.usage, "completion_tokens", None)
-        log_m.info(json.dumps({"ev":"llm_finish","finish":finish,"completion_tokens":c_tokens,"max_tokens":220}, ensure_ascii=False))
+        log_m.info({"ev":"llm_finish","finish":finish,"completion_tokens":c_tokens,"max_tokens":220})
         
         json_response = json.loads(completion.choices[0].message.content)
         
@@ -1722,6 +2284,9 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     """Основная функция для получения ответа и метаданных"""
     from logging import getLogger
     import json
+    import re
+    from datetime import datetime
+    
     logger = getLogger("cesi.rag")
     logger.info("➡️ Новый вопрос: %s", user_message)
     
@@ -1733,6 +2298,20 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
     detected_topics = []
     theme_hint = None
     rag_meta = {"user_query": user_message}
+    
+    # Инициализируем структурированный лог
+    rag_mode = os.getenv('RAG_MODE', 'PRECISE_SIMPLE')
+    structured_log = {
+        "ts": datetime.now().isoformat(),
+        "mode": rag_mode,
+        "query": user_message,
+        "mq_used": False,
+        "candidates_before": [],
+        "fusion": [],
+        "rerank": [],
+        "final_ctx": [],
+        "guard": {"best": 0.0, "second": 0.0, "margin": 0.0, "passed": False}
+    }
     
     try:
         # --- 1) Явный оверрайд темы по ключевым словам (если используешь root_aliases.yaml)
@@ -1782,6 +2361,12 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
             print(f"🔍 Поиск врачей: используем top_k={top_k}")
         else:
             top_k = int(os.getenv("RAG_TOP_K", 5))  # было 8, теперь 5 по умолчанию
+        
+        # Определяем use_mq для guard логики
+        mq_enable   = os.getenv('MQ_ENABLE_CONDITIONAL','true').lower() == 'true'
+        mq_minwords = int(os.getenv('MQ_MIN_WORDS','4'))
+        words = re.findall(r'\w+', user_message, flags=re.U)
+        use_mq = mq_enable and (len(words) >= mq_minwords)
         
         # Извлекаем релевантные чанки (используем новую логику)
         logger.info("🔎 theme_hint=%s detected_topics=%s", theme_hint, detected_topics)
@@ -1861,6 +2446,124 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
         if not relevant_chunks:
             # честный низкий релеванс
             return LOW_REL_JSON.copy(), rag_meta
+
+        # ==== GUARD С ENV ПОРОГАМИ ====
+        if os.getenv('GUARD_ENABLE', 'true').lower() == 'true':
+            # Находим лучший и второй score
+            scores = []
+            for chunk in relevant_chunks:
+                # В зависимости от режима используем разные score
+                rag_mode = os.getenv('RAG_MODE', 'PRECISE_SIMPLE')
+                if rag_mode == 'HYBRID_TIGHT':
+                    score = getattr(chunk, 'total_rrf', None) or getattr(chunk, 'hybrid', None) or getattr(chunk, 'score', 0.0)
+                else:
+                    score = getattr(chunk, 'score', 0.0)
+                scores.append(score)
+            
+            scores.sort(reverse=True)
+            best = scores[0] if scores else 0.0
+            second = scores[1] if len(scores) > 1 else 0.0
+            
+            # Пороги из ENV
+            hard_min = float(os.getenv('GUARD_THRESHOLD','0.60'))
+            dyn = os.getenv('GUARD_DYNAMIC','false').lower() == 'true'
+            soft_min = float(os.getenv('GUARD_SOFT_MIN','0.56'))
+            margin = float(os.getenv('GUARD_MARGIN','0.07'))
+
+            def passes_guard(b, s):
+                if not dyn:
+                    return b >= hard_min
+                if b >= hard_min:
+                    return True
+                if b >= soft_min and (b - (s or 0.0)) >= margin:
+                    return True
+                return False
+
+            # Логируем guard
+            try:
+                structured_log["guard"] = {
+                    "best": float(best),
+                    "second": float(second),
+                    "margin": float(best - second),
+                    "passed": passes_guard(best, second)
+                }
+            except Exception:
+                pass
+            
+            if not passes_guard(best, second):
+                # вторая попытка: узкий conditional MQ, если ещё не включали
+                mq_enable   = os.getenv('MQ_ENABLE_CONDITIONAL','true').lower() == 'true'
+                mq_maxvars  = int(os.getenv('MQ_MAX_VARIANTS','2'))
+                mq_budget   = int(os.getenv('MQ_MAX_CANDIDATES','4'))
+                
+                if mq_enable and not use_mq:
+                    qv = generate_query_variants(user_message)[:mq_maxvars]
+                    print(f"🔁 Low score (best={best:.3f}, second={second:.3f}) → дополнительный MQ={len(qv)}")
+                    extra = []
+                    for q2 in qv:
+                        e2 = embed_search(q2, top=3)
+                        b2 = bm25_search(q2, top=3)
+                        extra.extend(hybrid_merge(e2, b2, 3, 0.60, 0.40))
+                    # объединяем с бюджетом
+                    pool = (relevant_chunks + extra)[:max(6, mq_budget)]
+                    # повторим дедуп + когерентность
+                    uniq2 = {}
+                    for ch in pool:
+                        key = (ch.file_name, getattr(ch.metadata, "h2_id",""))
+                        if key not in uniq2: uniq2[key] = ch
+                    pool = list(uniq2.values())
+                    if pool:
+                        anchor = pool[0]
+                        atopic = (getattr(anchor, "metadata", None) or {}).topic or ""
+                        afile  = getattr(anchor, "file_name", "")
+                        coh = []
+                        seen = set()
+                        for ch in pool:
+                            if ch.file_name == afile or getattr(getattr(ch,"metadata",None),"topic","") == atopic:
+                                k = (ch.file_name, getattr(ch.metadata,"h2_id",""))
+                                if k not in seen:
+                                    coh.append(ch); seen.add(k)
+                        relevant_chunks = coh[:3] if coh else pool[:3]
+                        best  = getattr(relevant_chunks[0], 'hybrid', 0.0) if relevant_chunks else 0.0
+                        second= getattr(relevant_chunks[1], 'hybrid', 0.0) if len(relevant_chunks)>1 else 0.0
+                
+                if not passes_guard(best, second):
+                    # Возвращаем fallback без вызова LLM
+                    from core.logger import log_m
+                    log_m.info({
+                        "ev": "low_rel",
+                        "best": float(best),
+                        "second": float(second),
+                        "hard_min": float(hard_min),
+                        "soft_min": float(soft_min),
+                        "margin": float(margin),
+                        "passed": False
+                    })
+                    
+                    out = {
+                        "answer": "Хочу ответить точно. Подскажите, вас интересует адрес клиники, цены, врачи или противопоказания?",
+                        "empathy": "",
+                        "cta": {"show": False, "variant": "consult"},
+                        "followups": [
+                            {"label": "Адрес и контакты", "query": "адрес"},
+                            {"label": "Цены на имплантацию", "query": "цены"},
+                            {"label": "Противопоказания", "query": "противопоказания"}
+                        ]
+                    }
+                    return out, rag_meta
+                else:
+                    # Логируем успешное прохождение guard
+                    from core.logger import log_m
+                    log_m.info({
+                        "ev": "guard_passed",
+                        "best": float(best),
+                        "second": float(second),
+                        "hard_min": float(hard_min),
+                        "soft_min": float(soft_min),
+                        "margin": float(margin),
+                        "passed": True,
+                        "reason": "hard" if best >= hard_min else "soft+margin"
+                    })
 
         # --- 4) Синтез ответа из нескольких чанков
         synth = synthesize_answer(relevant_chunks, user_message)
@@ -1981,13 +2684,25 @@ def get_rag_answer(user_message: str, history: List[Dict] = []) -> tuple[str, di
         from logging import getLogger
         log_m = getLogger("cesi.minimal_logs")
         try:
-            log_m.info(json.dumps({
+            log_m.info({
                 "ev":"search_candidates",
                 "count": len(relevant_chunks),
                 "cands": format_candidates_for_log(relevant_chunks, top=3)
-            }, ensure_ascii=False))
+            })
         except Exception as e:
             logging.getLogger("cesi").warning(f"log_format_error: {e}")
+        
+        # Сохраняем структурированный лог
+        log_level = os.getenv('LOG_LEVEL', 'INFO')
+        if log_level in ('DEBUG', 'TRACE'):
+            try:
+                logs_dir = Path("logs")
+                logs_dir.mkdir(exist_ok=True)
+                log_file = logs_dir / "rag_trace.jsonl"
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(structured_log, ensure_ascii=False) + "\n")
+            except Exception as e:
+                print(f"❌ Ошибка сохранения структурированного лога: {e}")
         
         return payload, rag_meta
         

@@ -554,6 +554,7 @@ def chat():
             # Умная обрезка и санитизация с лимитами по темам
             from core.text_utils import finalize_answer, finalize_empathy
             from core.answer_style import decide_style
+            from core.answer_shaping import smart_trim
             
             theme = (rag_meta.get("theme_hint") or "").lower()
             style = decide_style(theme)
@@ -562,21 +563,17 @@ def chat():
             if theme == "contacts":
                 raw_answer = out.get("answer","")
                 formatted_answer = format_contacts_answer(raw_answer)
-                ans, cut_a = finalize_answer(
-                    formatted_answer,
-                    limit=style.max_chars,
-                    allow_ellipsis=style.allow_ellipsis,
-                    allow_bullets=False,  # контакты всегда параграф
-                    max_bullets=0,
-                )
+                # Умная обрезка для контактов
+                no_ellipsis_topics = {"safety","contraindications","warranty"}
+                allow_ellipsis = theme not in no_ellipsis_topics
+                ans = smart_trim(formatted_answer, limit=style.max_chars, allow_ellipsis=allow_ellipsis)
+                cut_a = len(ans) < len(formatted_answer)
             else:
-                ans, cut_a = finalize_answer(
-                    out.get("answer",""),
-                    limit=style.max_chars,
-                    allow_ellipsis=style.allow_ellipsis,
-                    allow_bullets=(style.mode=="list"),
-                    max_bullets=style.max_bullets,
-                )
+                # Умная обрезка для остальных тем
+                no_ellipsis_topics = {"safety","contraindications","warranty"}
+                allow_ellipsis = theme not in no_ellipsis_topics
+                ans = smart_trim(out.get("answer",""), limit=style.max_chars, allow_ellipsis=allow_ellipsis)
+                cut_a = len(ans) < len(out.get("answer",""))
             emp, cut_e = finalize_empathy(out.get("empathy",""), limit=200)
             out["answer"], out["empathy"] = ans, emp
             
@@ -649,6 +646,7 @@ def chat():
             # Умная обрезка и санитизация с лимитами по темам
             from core.text_utils import finalize_answer, finalize_empathy
             from core.answer_style import decide_style
+            from core.answer_shaping import smart_trim
             
             theme_legacy = (rag_meta.get("theme_hint") or "").lower()
             style_legacy = decide_style(theme_legacy)
@@ -657,21 +655,17 @@ def chat():
             if theme_legacy == "contacts":
                 raw_answer_legacy = out_legacy.get("answer","")
                 formatted_answer_legacy = format_contacts_answer(raw_answer_legacy)
-                ans_legacy, cut_a_legacy = finalize_answer(
-                    formatted_answer_legacy,
-                    limit=style_legacy.max_chars,
-                    allow_ellipsis=style_legacy.allow_ellipsis,
-                    allow_bullets=False,  # контакты всегда параграф
-                    max_bullets=0,
-                )
+                # Умная обрезка для контактов
+                no_ellipsis_topics = {"safety","contraindications","warranty"}
+                allow_ellipsis = theme_legacy not in no_ellipsis_topics
+                ans_legacy = smart_trim(formatted_answer_legacy, limit=style_legacy.max_chars, allow_ellipsis=allow_ellipsis)
+                cut_a_legacy = len(ans_legacy) < len(formatted_answer_legacy)
             else:
-                ans_legacy, cut_a_legacy = finalize_answer(
-                    out_legacy.get("answer",""),
-                    limit=style_legacy.max_chars,
-                    allow_ellipsis=style_legacy.allow_ellipsis,
-                    allow_bullets=(style_legacy.mode=="list"),
-                    max_bullets=style_legacy.max_bullets,
-                )
+                # Умная обрезка для остальных тем
+                no_ellipsis_topics = {"safety","contraindications","warranty"}
+                allow_ellipsis = theme_legacy not in no_ellipsis_topics
+                ans_legacy = smart_trim(out_legacy.get("answer",""), limit=style_legacy.max_chars, allow_ellipsis=allow_ellipsis)
+                cut_a_legacy = len(ans_legacy) < len(out_legacy.get("answer",""))
             emp_legacy, cut_e_legacy = finalize_empathy(out_legacy.get("empathy",""), limit=200)
             out_legacy["answer"], out_legacy["empathy"] = ans_legacy, emp_legacy
             
